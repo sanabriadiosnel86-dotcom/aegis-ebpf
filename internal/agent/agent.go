@@ -32,6 +32,36 @@ type Config struct {
 	// Rules defaults to fixer.DefaultRules.
 	Rules  []*fixer.Rule
 	Logger *slog.Logger
+	// Enricher, when set, resolves the Kubernetes pod of a container so that
+	// events carry a pod name and namespace. nil leaves events unenriched.
+	Enricher Enricher
+	// Responder, when set, reacts to high-severity events. nil keeps the
+	// agent purely passive.
+	Responder Responder
+	// WebDir, when set, is the directory of the built dashboard, served from
+	// the root of the HTTP handler.
+	WebDir string
+}
+
+// PodInfo is the Kubernetes identity of a container's pod.
+type PodInfo struct {
+	Name      string
+	Namespace string
+	UID       string
+}
+
+// Enricher resolves the pod a container belongs to. Its Lookup must be safe
+// for concurrent use and must not block, since it runs on the ingestion path;
+// implementations serve from an in-memory cache.
+type Enricher interface {
+	Lookup(containerID string) (PodInfo, bool)
+}
+
+// Responder reacts to a high-severity event, such as by deploying a decoy. It
+// is called from its own goroutine, after the event is stored, so it may
+// block. The agent stays passive when no Responder is configured.
+type Responder interface {
+	Respond(ev events.AuditEvent)
 }
 
 // Remediation aggregates every match of one rule for one container.
@@ -48,9 +78,13 @@ type Remediation struct {
 
 // Agent is the control plane. It is safe for concurrent use.
 type Agent struct {
-	rules   []*fixer.Rule
-	log     *slog.Logger
-	maxRems int
+	rules     []*fixer.Rule
+	log       *slog.Logger
+	maxRems   int
+	enricher  Enricher
+	responder Responder
+	stream    *hub
+	webDir    string
 
 	mu     sync.RWMutex
 	ring   []events.AuditEvent // recent events; ring[head] is the next slot to write
@@ -78,13 +112,17 @@ func New(cfg Config) *Agent {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
 	return &Agent{
-		rules:   cfg.Rules,
-		log:     cfg.Logger,
-		maxRems: cfg.MaxRemediations,
-		ring:    make([]events.AuditEvent, cfg.MaxEvents),
-		byID:    make(map[string]int),
-		rems:    make(map[string]*Remediation),
-		remFor:  make(map[remKey]*Remediation),
+		rules:     cfg.Rules,
+		log:       cfg.Logger,
+		maxRems:   cfg.MaxRemediations,
+		enricher:  cfg.Enricher,
+		responder: cfg.Responder,
+		stream:    newHub(),
+		webDir:    cfg.WebDir,
+		ring:      make([]events.AuditEvent, cfg.MaxEvents),
+		byID:      make(map[string]int),
+		rems:      make(map[string]*Remediation),
+		remFor:    make(map[remKey]*Remediation),
 	}
 }
 
@@ -113,12 +151,13 @@ func (a *Agent) Ingest(batch []events.AuditEvent) ([]string, error) {
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	ids := make([]string, len(batch))
+	stored := make([]events.AuditEvent, len(batch))
 	for i := range batch {
 		ev := batch[i]
 		ev.ID = newID()
 		ev.Severity = events.SeverityInfo
+		a.enrichLocked(&ev)
 		for _, r := range a.rules {
 			if !r.Matches(&ev) {
 				continue
@@ -132,8 +171,35 @@ func (a *Agent) Ingest(batch []events.AuditEvent) ([]string, error) {
 		}
 		a.storeLocked(ev)
 		ids[i] = ev.ID
+		stored[i] = ev
+	}
+	a.mu.Unlock()
+
+	// Publishing to subscribers and responders is done outside the lock: a
+	// slow subscriber or responder must never stall ingestion.
+	for i := range stored {
+		a.stream.publish(stored[i])
+		if a.responder != nil && stored[i].Severity.Rank() >= events.SeverityHigh.Rank() {
+			go a.responder.Respond(stored[i])
+		}
 	}
 	return ids, nil
+}
+
+// enrichLocked fills the pod of an event's container from the Enricher, when
+// one is configured and the probe did not already resolve it.
+func (a *Agent) enrichLocked(ev *events.AuditEvent) {
+	if a.enricher == nil || ev.Container == nil {
+		return
+	}
+	if ev.Container.Pod != nil && ev.Container.Pod.Name != "" {
+		return
+	}
+	pod, ok := a.enricher.Lookup(ev.Container.ID)
+	if !ok {
+		return
+	}
+	ev.Container.Pod = &events.Pod{Name: pod.Name, Namespace: pod.Namespace, UID: pod.UID}
 }
 
 func (a *Agent) storeLocked(ev events.AuditEvent) {

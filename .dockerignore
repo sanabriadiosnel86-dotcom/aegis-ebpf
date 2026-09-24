@@ -9,3 +9,6 @@
 !Cargo.toml
 !Cargo.lock
 !rustfmt.toml
+!web/
+web/node_modules/
+web/dist/

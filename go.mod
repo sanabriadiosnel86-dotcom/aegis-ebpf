@@ -3,6 +3,7 @@ module github.com/sanabriadiosnel86-dotcom/aegis-ebpf
 go 1.26.0
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/getkin/kin-openapi v0.149.0
 	go.yaml.in/yaml/v3 v3.0.5

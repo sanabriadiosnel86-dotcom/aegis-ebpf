@@ -1,11 +1,12 @@
-# Runs Aegis-eBPF on the local Docker host: `make up`, then query the agent
-# on http://127.0.0.1:8080 (see api/openapi.yaml).
+# Runs Aegis-eBPF on the local Docker host: `make up`, then open the dashboard
+# at http://127.0.0.1:8080 and query the agent under /v1 (see api/openapi.yaml).
 name: aegis
 
 services:
   agent:
     image: ${REGISTRY:-ghcr.io/sanabriadiosnel86-dotcom}/aegis-agent:${VERSION:-dev}
-    command: ["-listen", ":8080"]
+    # The bundled dashboard is served from the web root.
+    command: ["-listen", ":8080", "-web-dir", "/usr/share/aegis/web"]
     ports:
       - "127.0.0.1:8080:8080"
     read_only: true

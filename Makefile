@@ -8,6 +8,8 @@ REDOCLY  ?= redocly/cli:2.54.2
 # Extra flags for docker build, such as --platform=linux/arm64 or --no-cache.
 BUILD_FLAGS ?=
 
+KUBECTL  ?= kubectl
+
 AGENT_IMAGE := $(REGISTRY)/aegis-agent:$(VERSION)
 PROBE_IMAGE := $(REGISTRY)/aegis-probe:$(VERSION)
 BUILD       := $(DOCKER) build $(BUILD_FLAGS) --build-arg VERSION=$(VERSION)
@@ -33,8 +35,24 @@ image-agent: ## Build the image of the control plane
 image-probe: ## Build the image of the eBPF probe
 	$(BUILD) --target aegis-probe --tag $(PROBE_IMAGE) .
 
+.PHONY: build-web
+build-web: ## Build the dashboard into web/dist
+	$(BUILD) --target web --output type=local,dest=web/dist .
+
+.PHONY: deploy-k8s
+deploy-k8s: ## Apply the Kubernetes manifests (override images with VERSION=/REGISTRY=)
+	$(KUBECTL) apply -f deploy/k8s/namespace.yaml -f deploy/k8s/rbac.yaml
+	sed -e 's|ghcr.io/sanabriadiosnel86-dotcom/aegis-agent:dev|$(AGENT_IMAGE)|' \
+	    -e 's|ghcr.io/sanabriadiosnel86-dotcom/aegis-probe:dev|$(PROBE_IMAGE)|' \
+	    deploy/k8s/daemonset.yaml | $(KUBECTL) apply -f -
+
+.PHONY: undeploy-k8s
+undeploy-k8s: ## Remove the Kubernetes deployment
+	$(KUBECTL) delete -f deploy/k8s/daemonset.yaml --ignore-not-found
+	$(KUBECTL) delete -f deploy/k8s/rbac.yaml -f deploy/k8s/namespace.yaml --ignore-not-found
+
 .PHONY: test
-test: test-go test-rust lint-api ## Run every check
+test: test-go test-rust test-web lint-api ## Run every check
 
 .PHONY: test-go
 test-go: ## gofmt, go vet and the Go tests, OpenAPI contract tests included
@@ -43,6 +61,10 @@ test-go: ## gofmt, go vet and the Go tests, OpenAPI contract tests included
 .PHONY: test-rust
 test-rust: ## rustfmt, clippy and the Rust tests
 	$(BUILD) --target rust-test --output type=cacheonly .
+
+.PHONY: test-web
+test-web: ## Typecheck and build the dashboard
+	$(BUILD) --target web --output type=cacheonly .
 
 .PHONY: lint-api
 lint-api: ## Lint api/openapi.yaml with Redocly CLI
@@ -62,4 +84,4 @@ clean: ## Remove the compiled binaries
 
 .PHONY: help
 help: ## List the targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-12s %s\n", $$1, $$2 }'
+	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{ printf "  %-14s %s\n", $$1, $$2 }'

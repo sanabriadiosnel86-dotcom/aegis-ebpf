@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: #020617; /* slate-950 */
+  color: #e2e8f0; /* slate-200 */
+}
+
+/* A slim, dark scrollbar for the event feed. */
+.scroll-slim::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background-color: #1e293b; /* slate-800 */
+  border-radius: 9999px;
+}
+.scroll-slim::-webkit-scrollbar-track {
+  background-color: transparent;
+}

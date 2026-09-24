@@ -8,6 +8,8 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 
@@ -23,7 +25,10 @@ const (
 	maxLimit        = 1000
 )
 
-// Handler returns the HTTP API of a, as specified in api/openapi.yaml.
+// Handler returns the HTTP API of a. The request/response endpoints are
+// specified in api/openapi.yaml; GET /v1/stream is a WebSocket that streams
+// events live, and, when a web directory is configured, the dashboard is
+// served from the root.
 func (a *Agent) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.health)
@@ -33,7 +38,27 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/remediations", a.listRemediations)
 	mux.HandleFunc("GET /v1/remediations/{id}", a.getRemediation)
 	mux.HandleFunc("POST /v1/remediations/{id}/patch", a.patchManifest)
+	mux.HandleFunc("GET /v1/stream", a.streamEvents)
+	if a.webDir != "" {
+		mux.Handle("GET /", spaHandler(a.webDir))
+	}
 	return mux
+}
+
+// spaHandler serves the built dashboard from dir, falling back to index.html
+// so that client-side routing works.
+func spaHandler(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
+	index := filepath.Join(dir, "index.html")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if path := filepath.Join(dir, filepath.Clean(r.URL.Path)); path != dir {
+			if _, err := os.Stat(path); err == nil {
+				files.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.ServeFile(w, r, index)
+	})
 }
 
 type ingestResult struct {

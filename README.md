@@ -31,9 +31,13 @@ flowchart LR
 | [`crates/aegis-probe-ebpf`](crates/aegis-probe-ebpf) | Rust (`no_std`, [Aya](https://aya-rs.dev)) | Passive eBPF programs attached to kernel tracepoints. They write audit records in place into a `BPF_MAP_TYPE_RINGBUF`. |
 | [`crates/aegis-probe-common`](crates/aegis-probe-common) | Rust (`no_std`) | `#[repr(C)]` records shared by the kernel and user-space sides. |
 | [`crates/aegis-probe`](crates/aegis-probe) | Rust (Aya, Tokio) | Loads and attaches the programs, decodes the records into `AuditEvent`s, resolves the container of each process from `/proc`, and sends them to the agent in batches. |
-| [`cmd/aegis-agent`](cmd/aegis-agent) | Go | The control plane: ingests events, classifies them and keeps remediations ([`internal/agent`](internal/agent)). |
+| [`cmd/aegis-agent`](cmd/aegis-agent) | Go | The control plane: ingests events, classifies them, enriches them with pod identity, keeps remediations, and serves the API and the live stream ([`internal/agent`](internal/agent)). |
 | [`internal/fixer`](internal/fixer) | Go | The syntactic engine: rules that map events to hardening plans, and the engine that applies those plans to manifests. |
 | [`internal/events`](internal/events) | Go | The `AuditEvent` type, its payloads and their validation. |
+| [`internal/k8s`](internal/k8s) | Go | A read-only, in-cluster Kubernetes client that resolves the pod a container belongs to. |
+| [`internal/decoy`](internal/decoy) | Go | The opt-in honeypot responder: deploys an inert decoy on high-severity events. |
+| [`web/`](web) | React, Vite, Tailwind | The dashboard: a live audit console over the WebSocket stream. |
+| [`deploy/k8s/`](deploy/k8s) | Kubernetes | DaemonSet, RBAC and namespace manifests. |
 | [`api/openapi.yaml`](api/openapi.yaml) | OpenAPI 3.0 | Contract of the events and of the agent API. |
 
 ## Audit events and detections
@@ -92,17 +96,22 @@ make help       # every target
 | --- | --- |
 | `make build` | `bin/aegis-agent` and `bin/aegis-probe` |
 | `make images` | `ghcr.io/sanabriadiosnel86-dotcom/aegis-{agent,probe}:<version>` |
+| `make build-web` | The dashboard into `web/dist` |
 | `make test-go` | Go checks, including contract tests that validate every API exchange against `api/openapi.yaml` |
 | `make test-rust` | Rust checks |
+| `make test-web` | The dashboard's typecheck and build |
 | `make lint-api` | Redocly lint of the OpenAPI specification |
 
-Set `VERSION`, `REGISTRY` or `BUILD_FLAGS` (e.g. `BUILD_FLAGS=--platform=linux/arm64`)
+The dashboard is bundled into the agent image (served with
+`-web-dir /usr/share/aegis/web`), so `make images` builds it too. Set
+`VERSION`, `REGISTRY` or `BUILD_FLAGS` (e.g. `BUILD_FLAGS=--platform=linux/arm64`)
 to override the defaults.
 
 ## Run
 
 `make up` starts the agent and the probe on the local Docker host with
-[`deploy/compose.yaml`](deploy/compose.yaml). The probe runs privileged in the
+[`deploy/compose.yaml`](deploy/compose.yaml) and serves the dashboard at
+<http://127.0.0.1:8080>. The probe runs privileged in the
 PID namespace of the host; it needs Linux 5.8 or later and tracefs mounted on
 the host's `/sys/kernel/tracing`, which it reads through a read-only mount.
 Where tracefs is missing, `aegis-probe --mount-tracefs` mounts it; the probe
@@ -123,6 +132,51 @@ curl -s -X POST http://127.0.0.1:8080/v1/remediations/<id>/patch \
 them, which helps when working on the probe; `aegis-probe --help` lists its
 other options.
 
+## Dashboard
+
+The agent serves a real-time audit console. It subscribes to
+`GET /v1/stream`, a WebSocket that pushes every `AuditEvent` as it is
+ingested, and shows a live feed, per-severity counters and a graph that ties
+each event's pod, process and syscall together. It is a dark, single-page
+React app in [`web/`](web); `make images` bundles it into the agent image, and
+`make up` serves it at <http://127.0.0.1:8080>. During development,
+`cd web && npm install && npm run dev` runs it against an agent on
+`127.0.0.1:8080` with hot reload.
+
+## Kubernetes
+
+[`deploy/k8s/`](deploy/k8s) runs Aegis-eBPF as a DaemonSet: one pod per node
+with the probe (privileged, `hostPID`, tracefs mounted read-only) and the
+agent side by side. The agent resolves the pod that owns each container
+through the Kubernetes API, using a read-only `ServiceAccount` that may only
+`get`, `list` and `watch` pods and namespaces, and fills `container.pod` (name
+and namespace) on every event.
+
+```sh
+make images VERSION=v1              # build and push these to your registry
+make deploy-k8s VERSION=v1 REGISTRY=ghcr.io/you
+kubectl -n aegis get daemonset
+```
+
+`make deploy-k8s` applies the namespace, the RBAC and the DaemonSet,
+substituting the image reference. Enrichment is enabled with the agent's
+`-enrich-k8s` flag, which the DaemonSet sets.
+
+## Adaptive deception (opt-in)
+
+The agent can answer high-severity events with a honeypot. With `--decoy`, when
+an event reaches `high` or `critical` severity in a container, the
+[`internal/decoy`](internal/decoy) responder starts a lightweight decoy
+container on the **same network** as the offending workload, to catch
+lateral-movement probes. The decoy is deliberately inert: it presents a fake
+SSH banner, logs the source of every connection, and never runs anything a
+client sends. It is the only component that changes state on the host, which is
+why it is off by default; connections to it also show up as ordinary
+`network_connect` audit events. Deployments are deduplicated per container,
+rate-limited and capped, and the decoys are removed when the agent stops. It
+needs the Docker socket, so it is meant for the Docker-host deployment rather
+than the read-only Kubernetes one.
+
 ## Develop without Docker
 
 - Go 1.26 or later: `go test ./...`
@@ -130,16 +184,21 @@ other options.
   [`bpf-linker`](https://github.com/aya-rs/bpf-linker), which compile the eBPF
   programs: `cargo test`, then `sudo ./target/debug/aegis-probe`.
   Formatting uses nightly rustfmt: `cargo +nightly fmt`.
+- Dashboard: `cd web && npm install && npm run build` (or `npm run dev`).
 
 ## Current limits
 
 - The API has no authentication yet: keep the agent on loopback or on a
-  network that only the probe reaches.
+  network that only the probe reaches. The event stream is likewise open.
 - Events and remediations live in memory, bounded, and are lost on restart.
 - The container of a process is read from `/proc` when its event arrives, so
   events of very short-lived processes may lose it.
-- Pod names and container names are not resolved yet; without the container
-  name, plans target every container of the pod.
+- Container names are not resolved yet; without the container name, plans
+  target every container of the pod. Pod names are resolved in Kubernetes
+  through the API, keyed by container ID, and appear once the pod cache has
+  seen the container.
+- The decoy responder targets the Docker Engine API; it does not yet deploy
+  decoys through the Kubernetes API.
 - `process_exec` is recorded when `execve(2)` enters the kernel: attempts that
   fail, such as a program looked up along `PATH`, are recorded too, and
   `process.comm` names the calling process. Arguments are captured up to 16,
