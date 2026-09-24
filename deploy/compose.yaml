@@ -1,0 +1,32 @@
+# Runs Aegis-eBPF on the local Docker host: `make up`, then open the dashboard
+# at http://127.0.0.1:8080 and query the agent under /v1 (see api/openapi.yaml).
+name: aegis
+
+services:
+  agent:
+    image: ${REGISTRY:-ghcr.io/sanabriadiosnel86-dotcom}/aegis-agent:${VERSION:-dev}
+    # The bundled dashboard is served from the web root.
+    command: ["-listen", ":8080", "-web-dir", "/usr/share/aegis/web"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  probe:
+    image: ${REGISTRY:-ghcr.io/sanabriadiosnel86-dotcom}/aegis-probe:${VERSION:-dev}
+    command: ["--agent-url", "http://agent:8080/v1/events"]
+    environment:
+      RUST_LOG: info
+    # Loading eBPF programs requires privileges; the probe must also see the
+    # processes, the cgroup paths and the hostname of the host. It only reads
+    # tracefs (the IDs of the tracepoints), so the host's is mounted
+    # read-only; the host must have it mounted on /sys/kernel/tracing.
+    privileged: true
+    pid: host
+    cgroup: host
+    uts: host
+    read_only: true
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+    depends_on: [agent]

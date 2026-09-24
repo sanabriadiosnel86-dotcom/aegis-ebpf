@@ -1,0 +1,111 @@
+# One pod per node runs the probe and the agent side by side. The probe loads
+# the eBPF programs and forwards audit events to the agent over the loopback
+# they share; the agent resolves the owning pod of each container through the
+# Kubernetes API and serves the query and stream endpoints.
+#
+# Set the image tag with `make deploy-k8s VERSION=<tag>`, which substitutes it
+# before applying.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aegis
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aegis-ebpf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aegis-ebpf
+    spec:
+      serviceAccountName: aegis
+      # The probe observes the host's processes and loads eBPF programs.
+      hostPID: true
+      # Tolerate control-plane nodes so every node is audited.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: probe
+          image: ghcr.io/sanabriadiosnel86-dotcom/aegis-probe:dev
+          args:
+            - --agent-url
+            - http://127.0.0.1:8080/v1/events
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            # Loading eBPF programs and reading host memory need privilege.
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            # tracefs holds the tracepoint IDs the probe attaches to; it is
+            # mounted read-only, and the probe never writes to it.
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+        - name: agent
+          image: ghcr.io/sanabriadiosnel86-dotcom/aegis-agent:dev
+          args:
+            - -listen
+            - :8080
+            - -enrich-k8s
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
+            type: Directory
+---
+# A per-node endpoint for the dashboard and other consumers of the API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-agent
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+spec:
+  selector:
+    app.kubernetes.io/name: aegis-ebpf
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

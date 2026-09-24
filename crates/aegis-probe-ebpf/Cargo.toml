@@ -1,0 +1,22 @@
+[package]
+name = "aegis-probe-ebpf"
+description = "eBPF programs of the Aegis-eBPF probe"
+version.workspace = true
+edition.workspace = true
+# The kernel only lets GPL-compatible programs call helpers such as
+# bpf_probe_read_user_str; see LICENSE in src/main.rs.
+license = "MIT OR GPL-2.0-only"
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aegis-probe-common = { path = "../aegis-probe-common" }
+
+aya-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "aegis-probe"
+path = "src/main.rs"

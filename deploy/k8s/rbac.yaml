@@ -1,0 +1,36 @@
+# The agent reads pods and namespaces to resolve the pod that owns a
+# container. These are the only cluster resources it touches, and it only
+# reads them.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis
+  namespace: aegis
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aegis-reader
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aegis-reader
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aegis-reader
+subjects:
+  - kind: ServiceAccount
+    name: aegis
+    namespace: aegis

@@ -1,0 +1,11 @@
+[package]
+name = "aegis-probe-common"
+description = "Types shared by the eBPF programs and the user-space probe of Aegis-eBPF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"

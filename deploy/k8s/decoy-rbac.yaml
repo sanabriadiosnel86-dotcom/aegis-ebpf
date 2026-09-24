@@ -1,0 +1,34 @@
+# Extra, opt-in RBAC for the Kubernetes decoy responder.
+#
+# The base install (rbac.yaml) is strictly read-only. Applying this grants the
+# agent's ServiceAccount permission to create and delete decoy pods in any
+# namespace, which the responder needs when the agent runs with --decoy. Apply
+# it only when you enable the decoy, and add "-decoy" to the agent's args:
+#
+#   kubectl apply -f deploy/k8s/decoy-rbac.yaml
+#
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aegis-decoy
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, delete, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aegis-decoy
+  labels:
+    app.kubernetes.io/name: aegis-ebpf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aegis-decoy
+subjects:
+  - kind: ServiceAccount
+    name: aegis
+    namespace: aegis
