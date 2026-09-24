@@ -1,0 +1,5 @@
+# Findings of `make lint-api` (Redocly CLI) that are accepted on purpose.
+openapi.yaml:
+  operation-4xx-response:
+    # A liveness probe has no client errors.
+    - '#/paths/~1healthz/get/responses'

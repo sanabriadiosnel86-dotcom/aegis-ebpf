@@ -1,0 +1,752 @@
+openapi: 3.0.3
+info:
+  title: Aegis-eBPF Control Plane API
+  version: 0.1.0
+  description: |
+    Event and remediation API served by `aegis-agent`, the control plane of
+    Aegis-eBPF.
+
+    The eBPF probe (`aegis-probe`) observes security-relevant kernel activity
+    and reports it as **events** through `POST /v1/events`. The agent assigns
+    every event an `id` and a `severity`, evaluates it against the rules of
+    the syntactic fixer and aggregates matches into **remediations**:
+    hardening plans for the Kubernetes workload that owns the offending
+    container. `POST /v1/remediations/{remediationId}/patch` renders a plan
+    against a manifest and returns the patched YAML (comments and key order
+    preserved) together with an RFC 6902 JSON Patch per changed document.
+
+    This version has no authentication. Bind the agent to loopback or to the
+    network namespace it shares with the probe.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local agent (default listen address)
+# No authentication yet; see the description above.
+security: []
+tags:
+  - name: events
+    description: Kernel activity reported by the eBPF probe.
+  - name: remediations
+    description: Hardening plans produced by the syntactic fixer.
+  - name: health
+    description: Liveness of the agent.
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: getHealth
+      summary: Liveness probe
+      responses:
+        '200':
+          description: The agent is serving requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /v1/events:
+    post:
+      tags: [events]
+      operationId: ingestEvents
+      summary: Ingest a batch of events
+      description: |
+        Used by the probe to report kernel activity. The batch is atomic: if
+        any event is invalid, none is stored and the response lists every
+        error with the index of the offending event. The agent overwrites
+        `id` and `severity`, so clients do not send them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+            examples:
+              exec:
+                summary: A root shell started inside a container
+                value:
+                  events:
+                    - kind: process_exec
+                      time: '2026-09-23T23:01:02.123456789Z'
+                      node: worker-1
+                      process:
+                        pid: 4242
+                        ppid: 4100
+                        uid: 0
+                        gid: 0
+                        comm: sh
+                      container:
+                        id: 2d1f6c4a9e8b7d0c3f5a6b1e4d7c0a9f8e2b5d6c1a4f7e0b3d9c2a5f8e1b4d7c
+                        runtime: containerd
+                      data:
+                        filename: /bin/sh
+                        argv: [sh, -c, id]
+      responses:
+        '202':
+          description: Every event in the batch was accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    get:
+      tags: [events]
+      operationId: listEvents
+      summary: List recent events, newest first
+      description: |
+        The agent keeps a bounded in-memory window of recent events; older
+        events are evicted first.
+      parameters:
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/MinSeverity'
+        - $ref: '#/components/parameters/ContainerID'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Events matching every given filter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/events/{eventId}:
+    parameters:
+      - name: eventId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [events]
+      operationId: getEvent
+      summary: Get an event
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/remediations:
+    get:
+      tags: [remediations]
+      operationId: listRemediations
+      summary: List remediations, most recently seen first
+      description: |
+        A remediation aggregates every match of one rule for one container.
+      parameters:
+        - $ref: '#/components/parameters/MinSeverity'
+        - $ref: '#/components/parameters/ContainerID'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Remediations matching every given filter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemediationList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/remediations/{remediationId}:
+    parameters:
+      - $ref: '#/components/parameters/RemediationID'
+    get:
+      tags: [remediations]
+      operationId: getRemediation
+      summary: Get a remediation
+      responses:
+        '200':
+          description: The remediation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Remediation'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/remediations/{remediationId}/patch:
+    parameters:
+      - $ref: '#/components/parameters/RemediationID'
+    post:
+      tags: [remediations]
+      operationId: patchManifest
+      summary: Apply a remediation to a Kubernetes manifest
+      description: |
+        Applies the remediation's operations to every workload document of
+        the YAML stream (Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet,
+        Job, CronJob, ReplicationController). Other documents are copied
+        unchanged. The operation is idempotent: a manifest that already
+        satisfies the plan yields an empty `documents` list.
+      requestBody:
+        required: true
+        content:
+          application/yaml:
+            schema:
+              type: string
+            example: |
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: web
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: web # public frontend
+                        image: nginx:1.27
+      responses:
+        '200':
+          description: The patched manifest and the per-document JSON Patches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatchResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+components:
+  parameters:
+    Kind:
+      name: kind
+      in: query
+      description: Only return events of this kind.
+      schema:
+        $ref: '#/components/schemas/EventKind'
+    MinSeverity:
+      name: min_severity
+      in: query
+      description: Only return items at least this severe.
+      schema:
+        $ref: '#/components/schemas/Severity'
+    ContainerID:
+      name: container_id
+      in: query
+      description: Only return items that belong to this container.
+      schema:
+        $ref: '#/components/schemas/ContainerID'
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    RemediationID:
+      name: remediationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: The request is malformed or fails validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: The resource does not exist or was evicted.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: The request body exceeds the size limit of the endpoint.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: The request body has an unsupported Content-Type.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableEntity:
+      description: |
+        The manifest is valid YAML but cannot be patched: it contains no
+        workload, or a field on the patched path has an unexpected type.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    EventKind:
+      type: string
+      description: |
+        Kind of kernel activity reported by the probe:
+
+        * `process_exec`: a process replaced its image with `execve(2)`
+          (tracepoint `sched:sched_process_exec`).
+        * `file_open`: a file was opened with write intent (`O_WRONLY`,
+          `O_RDWR`, `O_CREAT` or `O_TRUNC`) through `openat(2)`.
+        * `privilege_escalation`: a successful `setuid(2)`, `setreuid(2)` or
+          `setresuid(2)` moved the real UID of a process from non-root to
+          root.
+      enum: [process_exec, file_open, privilege_escalation]
+
+    Severity:
+      type: string
+      description: |
+        Highest severity among the rules that matched, or `info` when no rule
+        matched.
+      enum: [info, low, medium, high, critical]
+
+    Event:
+      description: |
+        A security-relevant kernel event. `kind` selects the shape of `data`.
+      oneOf:
+        - $ref: '#/components/schemas/ProcessExecEvent'
+        - $ref: '#/components/schemas/FileOpenEvent'
+        - $ref: '#/components/schemas/PrivilegeEscalationEvent'
+      discriminator:
+        propertyName: kind
+        mapping:
+          process_exec: '#/components/schemas/ProcessExecEvent'
+          file_open: '#/components/schemas/FileOpenEvent'
+          privilege_escalation: '#/components/schemas/PrivilegeEscalationEvent'
+
+    EventBase:
+      type: object
+      description: Properties shared by every kind of event.
+      required: [id, kind, time, node, severity, process]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Assigned by the agent on ingestion (UUIDv7, time-ordered).
+        kind:
+          $ref: '#/components/schemas/EventKind'
+        time:
+          type: string
+          format: date-time
+          description: When the kernel observed the activity (RFC 3339, nanosecond precision).
+        node:
+          type: string
+          minLength: 1
+          maxLength: 253
+          description: Name of the node where the probe runs.
+        severity:
+          allOf:
+            - $ref: '#/components/schemas/Severity'
+          readOnly: true
+        process:
+          $ref: '#/components/schemas/Process'
+        container:
+          $ref: '#/components/schemas/Container'
+
+    ProcessExecEvent:
+      description: Event of kind `process_exec`.
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [data]
+          properties:
+            kind:
+              type: string
+              enum: [process_exec]
+            data:
+              $ref: '#/components/schemas/ProcessExecData'
+
+    FileOpenEvent:
+      description: Event of kind `file_open`.
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [data]
+          properties:
+            kind:
+              type: string
+              enum: [file_open]
+            data:
+              $ref: '#/components/schemas/FileOpenData'
+
+    PrivilegeEscalationEvent:
+      description: Event of kind `privilege_escalation`.
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [data]
+          properties:
+            kind:
+              type: string
+              enum: [privilege_escalation]
+            data:
+              $ref: '#/components/schemas/PrivilegeEscalationData'
+
+    ProcessExecData:
+      type: object
+      required: [filename]
+      properties:
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Path of the new program image, as passed to `execve(2)`.
+        argv:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+          description: |
+            Command line of the new image. Best effort: the probe reads it
+            from `/proc/<pid>/cmdline` and omits it when the process already
+            exited.
+
+    FileOpenData:
+      type: object
+      required: [path, flags]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            Path as passed to `openat(2)`. Relative paths are reported as-is,
+            without resolving the directory file descriptor.
+        flags:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/OpenFlag'
+
+    OpenFlag:
+      type: string
+      description: Access mode and creation flags of `open(2)` that express write intent.
+      enum: [O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND]
+
+    PrivilegeEscalationData:
+      type: object
+      required: [syscall, old_uid, new_uid]
+      properties:
+        syscall:
+          type: string
+          enum: [setuid, setreuid, setresuid]
+        old_uid:
+          $ref: '#/components/schemas/ID32'
+        new_uid:
+          $ref: '#/components/schemas/ID32'
+
+    ID32:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 4294967295
+      description: A Linux user or group ID.
+
+    Process:
+      type: object
+      required: [pid, uid, gid, comm]
+      properties:
+        pid:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Process ID (thread-group ID) in the PID namespace of the node.
+        ppid:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Parent process ID. Best effort, read from `/proc`.
+        uid:
+          $ref: '#/components/schemas/ID32'
+        gid:
+          $ref: '#/components/schemas/ID32'
+        comm:
+          type: string
+          maxLength: 64
+          description: Command name of the task, as in `/proc/<pid>/comm`.
+        cgroup_id:
+          type: integer
+          format: int64
+          minimum: 0
+          description: ID of the task's cgroup in the unified (v2) hierarchy.
+
+    ContainerID:
+      type: string
+      description: Full container ID as assigned by the runtime.
+      pattern: '^[0-9a-f]{64}$'
+
+    Container:
+      type: object
+      description: Container the process belongs to. Absent for host processes.
+      required: [id]
+      properties:
+        id:
+          $ref: '#/components/schemas/ContainerID'
+        runtime:
+          type: string
+          enum: [docker, containerd, cri-o, podman]
+        name:
+          type: string
+          maxLength: 63
+          pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+          description: |
+            Name of the container in its pod spec, when known. The fixer uses
+            it to target a single container; without it, plans target every
+            container of the pod.
+        pod:
+          $ref: '#/components/schemas/Pod'
+
+    Pod:
+      type: object
+      description: Kubernetes pod that runs the container, when known.
+      properties:
+        uid:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 253
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 63
+
+    EventBatch:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/Event'
+
+    IngestResult:
+      type: object
+      required: [accepted, ids]
+      properties:
+        accepted:
+          type: integer
+          minimum: 1
+        ids:
+          type: array
+          description: IDs assigned to the events, in request order.
+          items:
+            type: string
+            format: uuid
+
+    EventList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+
+    Rule:
+      type: object
+      description: A built-in rule of the syntactic fixer.
+      required: [id, title, description, severity]
+      properties:
+        id:
+          type: string
+          pattern: '^AEG-[0-9]{3}$'
+          example: AEG-002
+        title:
+          type: string
+        description:
+          type: string
+        severity:
+          $ref: '#/components/schemas/Severity'
+
+    FixOperation:
+      type: object
+      description: |
+        A syntactic edit, relative to the pod spec of a workload (`spec` of a
+        Pod, `spec.template.spec` of a Deployment, and so on). `path` follows
+        this grammar:
+
+            path     = segment *( "." segment )
+            segment  = name [ "[" selector "]" ]
+            selector = "*" / index / name "=" value
+
+        `[*]` selects every item of a list, `[2]` the third one and
+        `[name=web]` the items whose `name` is `web`.
+      required: [op, path, value]
+      properties:
+        op:
+          type: string
+          enum: [set, add]
+          description: |
+            * `set`: set the value at `path`, creating missing mappings.
+            * `add`: make sure the list at `path` contains `value`, creating
+              the list when missing.
+        path:
+          type: string
+          example: containers[name=web].securityContext.allowPrivilegeEscalation
+        value:
+          description: Scalar to set, or to add to the list.
+          example: false
+
+    Remediation:
+      type: object
+      description: |
+        Every match of one rule for one container, with the plan that fixes
+        the workload running it.
+      required: [id, rule, container, event_id, occurrences, first_seen, last_seen, operations]
+      properties:
+        id:
+          type: string
+          format: uuid
+        rule:
+          $ref: '#/components/schemas/Rule'
+        container:
+          $ref: '#/components/schemas/Container'
+        event_id:
+          type: string
+          format: uuid
+          description: Event that opened the remediation.
+        occurrences:
+          type: integer
+          minimum: 1
+          description: Number of events that matched the rule for this container.
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        operations:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/FixOperation'
+
+    RemediationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Remediation'
+
+    PatchResult:
+      type: object
+      required: [remediation_id, manifest, documents]
+      properties:
+        remediation_id:
+          type: string
+          format: uuid
+        manifest:
+          type: string
+          description: The patched YAML stream; the unmodified input when nothing changed.
+        documents:
+          type: array
+          description: Documents that changed, in stream order.
+          items:
+            $ref: '#/components/schemas/DocumentPatch'
+
+    DocumentPatch:
+      type: object
+      required: [index, kind, patch]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position of the document in the YAML stream.
+        api_version:
+          type: string
+        kind:
+          type: string
+        name:
+          type: string
+        namespace:
+          type: string
+        patch:
+          type: array
+          minItems: 1
+          description: |
+            RFC 6902 JSON Patch that turns the JSON form of the original
+            document into the patched one (`kubectl patch --type=json`).
+          items:
+            $ref: '#/components/schemas/JSONPatchOperation'
+
+    JSONPatchOperation:
+      type: object
+      required: [op, path, value]
+      properties:
+        op:
+          type: string
+          enum: [add, replace]
+        path:
+          type: string
+          description: JSON Pointer (RFC 6901) into the document.
+          example: /spec/template/spec/containers/0/securityContext
+        value:
+          description: Value to add or to replace with.
+
+    Problem:
+      type: object
+      description: Problem details (RFC 9457).
+      required: [title, status]
+      properties:
+        type:
+          type: string
+          default: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        errors:
+          type: array
+          description: Individual validation errors.
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    FieldError:
+      type: object
+      required: [message]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Position of the offending event in the batch.
+        message:
+          type: string

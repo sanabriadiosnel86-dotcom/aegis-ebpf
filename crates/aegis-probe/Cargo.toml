@@ -1,0 +1,35 @@
+[package]
+name = "aegis-probe"
+description = "User-space loader of the Aegis-eBPF probe: attaches the eBPF programs and forwards their events to aegis-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+aegis-probe-common = { path = "../aegis-probe-common" }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+clap = { workspace = true, features = ["derive", "env", "help", "usage", "error-context"] }
+env_logger = { workspace = true }
+humantime = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+# Tells cargo to rebuild the probe when the eBPF programs change; the build
+# script compiles them for the BPF target (see aya-template for background).
+aegis-probe-ebpf = { path = "../aegis-probe-ebpf" }
+
+[[bin]]
+name = "aegis-probe"
+path = "src/main.rs"

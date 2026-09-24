@@ -1,0 +1,27 @@
+# Runs Aegis-eBPF on the local Docker host: `make up`, then query the agent
+# on http://127.0.0.1:8080 (see api/openapi.yaml).
+name: aegis
+
+services:
+  agent:
+    image: ${REGISTRY:-ghcr.io/sanabriadiosnel86-dotcom}/aegis-agent:${VERSION:-dev}
+    command: ["-listen", ":8080"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  probe:
+    image: ${REGISTRY:-ghcr.io/sanabriadiosnel86-dotcom}/aegis-probe:${VERSION:-dev}
+    command: ["--agent-url", "http://agent:8080/v1/events"]
+    environment:
+      RUST_LOG: info
+    # Loading eBPF programs requires privileges; the probe must also see the
+    # processes, the cgroup paths and the hostname of the host.
+    privileged: true
+    pid: host
+    cgroup: host
+    uts: host
+    read_only: true
+    depends_on: [agent]

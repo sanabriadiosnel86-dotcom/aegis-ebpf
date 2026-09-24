@@ -1,0 +1,11 @@
+# Send only the sources to the Docker build context.
+*
+!api/
+!cmd/
+!internal/
+!crates/
+!go.mod
+!go.sum
+!Cargo.toml
+!Cargo.lock
+!rustfmt.toml
