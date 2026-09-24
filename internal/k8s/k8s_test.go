@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -98,5 +99,56 @@ func TestPodCacheServesLastRefresh(t *testing.T) {
 	}
 	if _, ok := cache.Lookup(webID); ok {
 		t.Error("Lookup(web) still succeeds after the pod left the node")
+	}
+}
+
+func TestCreateAndDeletePod(t *testing.T) {
+	var method, path, body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"metadata":{"name":"aegis-decoy-xy12","namespace":"shop","uid":"uid-9"}}`))
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"kind":"Status","status":"Success"}`))
+		}
+	}))
+	defer srv.Close()
+	client := &Client{http: srv.Client(), baseURL: srv.URL, token: "sa-token"}
+
+	created, err := client.CreatePod(context.Background(), "shop", []byte(`{"kind":"Pod"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodPost || path != "/api/v1/namespaces/shop/pods" {
+		t.Errorf("create request = %s %s", method, path)
+	}
+	if body != `{"kind":"Pod"}` {
+		t.Errorf("create body = %q", body)
+	}
+	if created.Name != "aegis-decoy-xy12" || created.Namespace != "shop" || created.UID != "uid-9" {
+		t.Errorf("created = %+v", created)
+	}
+
+	if err := client.DeletePod(context.Background(), "shop", "aegis-decoy-xy12"); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodDelete || path != "/api/v1/namespaces/shop/pods/aegis-decoy-xy12" {
+		t.Errorf("delete request = %s %s", method, path)
+	}
+}
+
+func TestDeletePodIgnoresMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	client := &Client{http: srv.Client(), baseURL: srv.URL, token: "t"}
+	if err := client.DeletePod(context.Background(), "shop", "gone"); err != nil {
+		t.Errorf("deleting a missing pod should be a no-op, got %v", err)
 	}
 }

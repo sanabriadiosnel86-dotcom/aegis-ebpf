@@ -58,13 +58,22 @@ type Trigger struct {
 	ContainerID string
 	Severity    events.Severity
 	Rule        string
+	// Namespace and PodName identify the offending workload when the event
+	// was enriched from Kubernetes; the Kubernetes deployer places the decoy
+	// in Namespace.
+	Namespace string
+	PodName   string
 }
 
-// Decoy identifies a deployed honeypot container.
+// Decoy identifies a deployed honeypot: a Docker container or a Kubernetes
+// pod.
 type Decoy struct {
-	ID      string
-	Name    string
+	ID   string
+	Name string
+	// Network is the Docker network a container decoy joined.
 	Network string
+	// Namespace is the Kubernetes namespace a pod decoy was created in.
+	Namespace string
 }
 
 // Deployer starts a decoy for a trigger. The Docker implementation inspects
@@ -110,6 +119,13 @@ func NewResponder(cfg Config) (*Responder, error) {
 	return newResponder(cfg), nil
 }
 
+// NewWithDeployer builds a Responder around a caller-provided Deployer, such
+// as the Kubernetes deployer. It applies the same policy as NewResponder.
+func NewWithDeployer(cfg Config, deployer Deployer) *Responder {
+	cfg.deployer = deployer
+	return newResponder(cfg)
+}
+
 func newResponder(cfg Config) *Responder {
 	if cfg.MaxDecoys <= 0 {
 		cfg.MaxDecoys = 16
@@ -138,6 +154,9 @@ func (r *Responder) Respond(ev events.AuditEvent) {
 		return // no network to place a decoy on
 	}
 	trigger := Trigger{ContainerID: ev.Container.ID, Severity: ev.Severity}
+	if pod := ev.Container.Pod; pod != nil {
+		trigger.Namespace, trigger.PodName = pod.Namespace, pod.Name
+	}
 	if !r.admit(trigger) {
 		return
 	}
@@ -151,7 +170,7 @@ func (r *Responder) Respond(ev events.AuditEvent) {
 	}
 	r.confirm(trigger.ContainerID, decoy)
 	r.log.Warn("decoy deployed",
-		"decoy", decoy.Name, "network", decoy.Network,
+		"decoy", decoy.Name, "network", decoy.Network, "namespace", decoy.Namespace,
 		"offending_container", trigger.ContainerID, "severity", ev.Severity)
 }
 

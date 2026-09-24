@@ -66,21 +66,25 @@ func run(args []string) error {
 		Logger:          log,
 		WebDir:          *webDir,
 	}
+
+	// A single Kubernetes client serves both enrichment and, in-cluster, the
+	// decoy responder.
+	var kubeClient *k8s.Client
 	if *enrichK8s {
-		enricher, err := startEnricher(ctx, *nodeName, log)
+		client, err := k8s.InCluster()
 		if err != nil {
-			return err
+			return fmt.Errorf("connecting to the Kubernetes API: %w", err)
 		}
-		cfg.Enricher = enricher
+		kubeClient = client
+		cfg.Enricher = startEnricher(ctx, client, *nodeName, log)
 	}
 	if *deployDecoy {
-		responder, err := decoy.NewResponder(decoy.Config{Image: *decoyImage, Logger: log})
+		responder, err := buildResponder(kubeClient, *decoyImage, log)
 		if err != nil {
 			return fmt.Errorf("starting the decoy responder: %w", err)
 		}
 		defer responder.Close()
 		cfg.Responder = responder
-		log.Warn("decoy responder enabled: high-severity events will start honeypot containers")
 	}
 
 	ag := agent.New(cfg)
@@ -116,11 +120,7 @@ func run(args []string) error {
 
 // startEnricher builds the Kubernetes pod cache and starts its background
 // refresh, returning an agent.Enricher backed by it.
-func startEnricher(ctx context.Context, nodeName string, log *slog.Logger) (agent.Enricher, error) {
-	client, err := k8s.InCluster()
-	if err != nil {
-		return nil, fmt.Errorf("connecting to the Kubernetes API: %w", err)
-	}
+func startEnricher(ctx context.Context, client *k8s.Client, nodeName string, log *slog.Logger) agent.Enricher {
 	cache := k8s.NewPodCache(client, nodeName, log)
 	// Prime the cache so early events are enriched; failure is not fatal, the
 	// background loop will retry.
@@ -128,7 +128,19 @@ func startEnricher(ctx context.Context, nodeName string, log *slog.Logger) (agen
 		log.Warn("priming the pod cache failed", "error", err)
 	}
 	go cache.Run(ctx, 30*time.Second)
-	return podEnricher{cache}, nil
+	return podEnricher{cache}
+}
+
+// buildResponder chooses the decoy backend: the Kubernetes API when the agent
+// runs in a cluster (--enrich-k8s), the Docker socket otherwise.
+func buildResponder(kubeClient *k8s.Client, image string, log *slog.Logger) (*decoy.Responder, error) {
+	if kubeClient != nil {
+		log.Warn("decoy responder enabled (Kubernetes): high-severity events will create honeypot pods")
+		deployer := decoy.NewK8sDeployer(kubeClient, image)
+		return decoy.NewWithDeployer(decoy.Config{Image: image, Logger: log}, deployer), nil
+	}
+	log.Warn("decoy responder enabled (Docker): high-severity events will start honeypot containers")
+	return decoy.NewResponder(decoy.Config{Image: image, Logger: log})
 }
 
 // podEnricher adapts a k8s.PodCache to the agent.Enricher interface.

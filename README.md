@@ -166,16 +166,24 @@ substituting the image reference. Enrichment is enabled with the agent's
 
 The agent can answer high-severity events with a honeypot. With `--decoy`, when
 an event reaches `high` or `critical` severity in a container, the
-[`internal/decoy`](internal/decoy) responder starts a lightweight decoy
-container on the **same network** as the offending workload, to catch
-lateral-movement probes. The decoy is deliberately inert: it presents a fake
-SSH banner, logs the source of every connection, and never runs anything a
-client sends. It is the only component that changes state on the host, which is
-why it is off by default; connections to it also show up as ordinary
-`network_connect` audit events. Deployments are deduplicated per container,
-rate-limited and capped, and the decoys are removed when the agent stops. It
-needs the Docker socket, so it is meant for the Docker-host deployment rather
-than the read-only Kubernetes one.
+[`internal/decoy`](internal/decoy) responder starts a lightweight decoy beside
+the offending workload, to catch lateral-movement probes. It picks its backend
+from where the agent runs:
+
+- **Kubernetes** (with `-enrich-k8s`): it creates an ephemeral decoy **pod in
+  the offending pod's namespace**, hardened (non-root, read-only root
+  filesystem, all capabilities dropped, no ServiceAccount token) and bounded by
+  `activeDeadlineSeconds`. This needs the extra, opt-in RBAC in
+  [`deploy/k8s/decoy-rbac.yaml`](deploy/k8s/decoy-rbac.yaml).
+- **Docker**: it starts a decoy container on the **same network** as the
+  offending container, through the Docker socket.
+
+The decoy is deliberately inert in both cases: it presents a fake SSH banner,
+logs the source of every connection, and never runs anything a client sends.
+It is the only component that changes state, which is why it is off by default;
+connections to it also show up as ordinary `network_connect` audit events.
+Deployments are deduplicated per container, rate-limited and capped, and the
+decoys are removed when the agent stops.
 
 ## Develop without Docker
 
@@ -197,8 +205,8 @@ than the read-only Kubernetes one.
   target every container of the pod. Pod names are resolved in Kubernetes
   through the API, keyed by container ID, and appear once the pod cache has
   seen the container.
-- The decoy responder targets the Docker Engine API; it does not yet deploy
-  decoys through the Kubernetes API.
+- The Kubernetes decoy needs the offending pod's namespace, which comes from
+  enrichment, so it only fires for events the pod cache has already resolved.
 - `process_exec` is recorded when `execve(2)` enters the kernel: attempts that
   fail, such as a program looked up along `PATH`, are recorded too, and
   `process.comm` names the calling process. Arguments are captured up to 16,

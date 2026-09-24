@@ -1,18 +1,23 @@
-// Package k8s resolves the Kubernetes pod a container belongs to, so that the
-// agent can enrich audit events with a pod name and namespace.
+// Package k8s talks to the Kubernetes API server so that the agent can
+// resolve the pod a container belongs to and enrich audit events with its
+// name and namespace.
 //
 // It talks to the API server directly over HTTP, with the in-cluster
 // ServiceAccount credentials, rather than pulling in a large client library.
-// It only ever reads (lists pods), in keeping with the read-only posture of
-// Aegis-eBPF.
+// Enrichment only reads (it lists pods), in keeping with the read-only posture
+// of Aegis-eBPF. The opt-in decoy responder additionally creates and deletes
+// decoy pods through CreatePod and DeletePod; those need their own RBAC and
+// are never used unless the agent runs with --decoy.
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -230,4 +235,69 @@ func (c *PodCache) Run(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// CreatedPod is what CreatePod returns: the server-assigned identity of the
+// new pod.
+type CreatedPod struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	UID       string `json:"uid"`
+}
+
+// CreatePod creates a pod in namespace from its JSON manifest and returns its
+// server-assigned identity. It is used only by the opt-in decoy responder.
+func (c *Client) CreatePod(ctx context.Context, namespace string, manifest []byte) (CreatedPod, error) {
+	u := fmt.Sprintf("%s/api/v1/namespaces/%s/pods", c.baseURL, url.PathEscape(namespace))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(manifest))
+	if err != nil {
+		return CreatedPod{}, err
+	}
+	req.Header.Set(tokenField, "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return CreatedPod{}, fmt.Errorf("k8s: creating a pod: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return CreatedPod{}, fmt.Errorf("k8s: creating a pod: server returned %s: %s", resp.Status, readError(resp))
+	}
+	var created struct {
+		Metadata CreatedPod `json:"metadata"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return CreatedPod{}, fmt.Errorf("k8s: decoding the created pod: %w", err)
+	}
+	return created.Metadata, nil
+}
+
+// DeletePod deletes a pod. A pod that is already gone is not an error.
+func (c *Client) DeletePod(ctx context.Context, namespace, name string) error {
+	u := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, url.PathEscape(namespace), url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(tokenField, "Bearer "+c.token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("k8s: deleting pod %s/%s: %w", namespace, name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("k8s: deleting pod %s/%s: server returned %s", namespace, name, resp.Status)
+	}
+	return nil
+}
+
+// readError returns the trimmed body of a failed response, for error context.
+func readError(resp *http.Response) string {
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<14))
+	return strings.TrimSpace(string(msg))
 }
