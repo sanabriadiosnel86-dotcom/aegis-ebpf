@@ -74,7 +74,7 @@ func (a *Agent) ingestEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var batch struct {
-		Events []events.Event `json:"events"`
+		Events []events.AuditEvent `json:"events"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxEventsBody)).Decode(&batch); err != nil {
 		writeBodyError(w, err)
@@ -103,7 +103,7 @@ func (a *Agent) listEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	evs := a.Events(EventFilter{Kind: kind, MinSeverity: q.minSeverity, ContainerID: q.containerID, Limit: q.limit})
-	writeJSON(w, http.StatusOK, list[events.Event]{Items: evs})
+	writeJSON(w, http.StatusOK, list[events.AuditEvent]{Items: evs})
 }
 
 func (a *Agent) getEvent(w http.ResponseWriter, r *http.Request) {

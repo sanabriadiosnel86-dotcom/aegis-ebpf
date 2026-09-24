@@ -11,8 +11,8 @@ import (
 
 const containerID = "2d1f6c4a9e8b7d0c3f5a6b1e4d7c0a9f8e2b5d6c1a4f7e0b3d9c2a5f8e1b4d7c"
 
-func event(kind events.Kind, uid uint32, data events.Data, container *events.Container) *events.Event {
-	return &events.Event{
+func event(kind events.Kind, uid uint32, data events.Data, container *events.Container) *events.AuditEvent {
+	return &events.AuditEvent{
 		Kind:      kind,
 		Time:      time.Unix(1790000000, 0),
 		Node:      "worker-1",
@@ -32,7 +32,7 @@ func TestDefaultRulesMatch(t *testing.T) {
 
 	tests := []struct {
 		name string
-		ev   *events.Event
+		ev   *events.AuditEvent
 		want []string // IDs of the matching rules
 	}{
 		{"root exec in container", event(events.KindProcessExec, 0, exec, c), []string{"AEG-001"}},

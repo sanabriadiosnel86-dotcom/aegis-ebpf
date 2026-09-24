@@ -18,10 +18,14 @@ services:
     environment:
       RUST_LOG: info
     # Loading eBPF programs requires privileges; the probe must also see the
-    # processes, the cgroup paths and the hostname of the host.
+    # processes, the cgroup paths and the hostname of the host. It only reads
+    # tracefs (the IDs of the tracepoints), so the host's is mounted
+    # read-only; the host must have it mounted on /sys/kernel/tracing.
     privileged: true
     pid: host
     cgroup: host
     uts: host
     read_only: true
+    volumes:
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
     depends_on: [agent]

@@ -12,6 +12,18 @@ pub const TASK_COMM_LEN: usize = 16;
 /// truncated.
 pub const MAX_PATH_LEN: usize = 512;
 
+/// Bytes captured from a single command-line argument, NUL terminator
+/// included. Longer arguments are truncated.
+pub const ARG_LEN: usize = 128;
+
+/// Number of command-line arguments captured from an `execve(2)`. It is a
+/// power of two so the eBPF program can index the buffer with a masked,
+/// verifier-friendly offset.
+pub const MAX_ARGV: usize = 16;
+
+/// Bytes of an IP address: 4 for IPv4 (in the first four), 16 for IPv6.
+pub const ADDR_LEN: usize = 16;
+
 /// Values of [`EventHeader::kind`].
 pub mod kind {
     /// [`ProcessExec`](super::ProcessExec).
@@ -20,6 +32,10 @@ pub mod kind {
     pub const FILE_OPEN: u32 = 2;
     /// [`PrivilegeEscalation`](super::PrivilegeEscalation).
     pub const PRIVILEGE_ESCALATION: u32 = 3;
+    /// [`NetworkConnect`](super::NetworkConnect).
+    pub const NETWORK_CONNECT: u32 = 4;
+    /// [`Ptrace`](super::Ptrace).
+    pub const PTRACE: u32 = 5;
 }
 
 /// `open(2)` flags. Their values are the same on x86_64 and aarch64.
@@ -36,6 +52,12 @@ pub mod open_flags {
     pub const fn is_write_intent(flags: u32) -> bool {
         flags & O_ACCMODE != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0
     }
+}
+
+/// Socket address families, as `sa_family_t` reports them.
+pub mod address_family {
+    pub const AF_INET: u16 = 2;
+    pub const AF_INET6: u16 = 10;
 }
 
 /// Fields shared by every event.
@@ -58,13 +80,24 @@ pub struct EventHeader {
     pub comm: [u8; TASK_COMM_LEN],
 }
 
-/// A process replaced its image with `execve(2)`.
+/// A process asked to replace its image with `execve(2)`.
+///
+/// The event is reported at syscall entry, so `header.comm` is the name of
+/// the calling process (for example a shell), while `filename` is the program
+/// it is about to run.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessExec {
     pub header: EventHeader,
     /// NUL-terminated path of the new image.
     pub filename: [u8; MAX_PATH_LEN],
+    /// The first [`MAX_ARGV`] arguments, each a NUL-terminated string in its
+    /// own slot. Unused slots begin with a NUL.
+    pub args: [[u8; ARG_LEN]; MAX_ARGV],
+    /// Number of arguments stored in `args`.
+    pub argc: u32,
+    /// Non-zero when the command line had more than [`MAX_ARGV`] arguments.
+    pub argv_truncated: u32,
 }
 
 /// A file was opened with write intent.
@@ -93,6 +126,38 @@ pub struct PrivilegeEscalation {
     pub _pad: u32,
 }
 
+/// A process started an outbound connection with `connect(2)` to an IPv4 or
+/// IPv6 address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkConnect {
+    pub header: EventHeader,
+    /// The socket's file descriptor.
+    pub fd: i32,
+    /// Address family: [`address_family::AF_INET`] or `AF_INET6`.
+    pub family: u16,
+    /// Destination port, in host byte order.
+    pub port: u16,
+    /// Destination address in network byte order: IPv4 in the first four
+    /// bytes, IPv6 in all sixteen.
+    pub addr: [u8; ADDR_LEN],
+}
+
+/// A process called `ptrace(2)`, which can read or write another process's
+/// memory and registers, a common step of code injection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Ptrace {
+    pub header: EventHeader,
+    /// The `request` argument, i.e. the ptrace operation.
+    pub request: i64,
+    /// The `pid` argument: the process the caller wants to manipulate.
+    pub target_pid: i32,
+    pub _pad: u32,
+    /// The `addr` argument, the target address of a peek or poke.
+    pub addr: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use core::mem::{align_of, size_of};
@@ -101,7 +166,8 @@ mod tests {
 
     #[test]
     fn layouts_fit_the_ring_buffer() {
-        // The kernel reserves ring buffer records on 8-byte boundaries.
+        // The kernel reserves ring buffer records on 8-byte boundaries, so
+        // every record must have an alignment of at most 8.
         assert_eq!(size_of::<EventHeader>(), 48);
         for (size, align) in [
             (size_of::<ProcessExec>(), align_of::<ProcessExec>()),
@@ -110,9 +176,11 @@ mod tests {
                 size_of::<PrivilegeEscalation>(),
                 align_of::<PrivilegeEscalation>(),
             ),
+            (size_of::<NetworkConnect>(), align_of::<NetworkConnect>()),
+            (size_of::<Ptrace>(), align_of::<Ptrace>()),
         ] {
-            assert_eq!(size % 8, 0);
-            assert!(align <= 8);
+            assert_eq!(size % 8, 0, "size {size} is not a multiple of 8");
+            assert!(align <= 8, "alignment {align} exceeds 8");
         }
     }
 

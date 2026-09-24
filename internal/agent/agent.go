@@ -53,7 +53,7 @@ type Agent struct {
 	maxRems int
 
 	mu     sync.RWMutex
-	ring   []events.Event // recent events; ring[head] is the next slot to write
+	ring   []events.AuditEvent // recent events; ring[head] is the next slot to write
 	head   int
 	stored int
 	byID   map[string]int // event ID to position in ring
@@ -81,7 +81,7 @@ func New(cfg Config) *Agent {
 		rules:   cfg.Rules,
 		log:     cfg.Logger,
 		maxRems: cfg.MaxRemediations,
-		ring:    make([]events.Event, cfg.MaxEvents),
+		ring:    make([]events.AuditEvent, cfg.MaxEvents),
 		byID:    make(map[string]int),
 		rems:    make(map[string]*Remediation),
 		remFor:  make(map[remKey]*Remediation),
@@ -101,7 +101,7 @@ func (e *InvalidEventError) Unwrap() error { return e.Err }
 // IDs assigned to them. The batch is atomic: if an event is invalid, Ingest
 // stores nothing and returns one *InvalidEventError per invalid event,
 // joined.
-func (a *Agent) Ingest(batch []events.Event) ([]string, error) {
+func (a *Agent) Ingest(batch []events.AuditEvent) ([]string, error) {
 	var errs []error
 	for i := range batch {
 		if err := batch[i].Validate(); err != nil {
@@ -136,7 +136,7 @@ func (a *Agent) Ingest(batch []events.Event) ([]string, error) {
 	return ids, nil
 }
 
-func (a *Agent) storeLocked(ev events.Event) {
+func (a *Agent) storeLocked(ev events.AuditEvent) {
 	if a.stored == len(a.ring) {
 		delete(a.byID, a.ring[a.head].ID)
 	} else {
@@ -149,7 +149,7 @@ func (a *Agent) storeLocked(ev events.Event) {
 
 // recordLocked adds ev, which matched r, to the remediation of r for the
 // container of ev.
-func (a *Agent) recordLocked(r *fixer.Rule, ev *events.Event) {
+func (a *Agent) recordLocked(r *fixer.Rule, ev *events.AuditEvent) {
 	key := remKey{r.ID, ev.Container.ID}
 	if rem, ok := a.remFor[key]; ok {
 		rem.Occurrences++
@@ -201,10 +201,10 @@ type EventFilter struct {
 }
 
 // Events returns the stored events that match f, newest first.
-func (a *Agent) Events(f EventFilter) []events.Event {
+func (a *Agent) Events(f EventFilter) []events.AuditEvent {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	out := []events.Event{}
+	out := []events.AuditEvent{}
 	for i := 1; i <= a.stored && (f.Limit <= 0 || len(out) < f.Limit); i++ {
 		ev := a.ring[(a.head-i+len(a.ring))%len(a.ring)]
 		if f.Kind != "" && ev.Kind != f.Kind ||
@@ -218,12 +218,12 @@ func (a *Agent) Events(f EventFilter) []events.Event {
 }
 
 // Event returns the stored event with the given ID.
-func (a *Agent) Event(id string) (events.Event, error) {
+func (a *Agent) Event(id string) (events.AuditEvent, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	i, ok := a.byID[id]
 	if !ok {
-		return events.Event{}, ErrNotFound
+		return events.AuditEvent{}, ErrNotFound
 	}
 	return a.ring[i], nil
 }

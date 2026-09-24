@@ -19,8 +19,8 @@ const (
 
 var t0 = time.Date(2026, 9, 23, 23, 0, 0, 0, time.UTC)
 
-func execEvent(at time.Duration, uid uint32, containerID string) events.Event {
-	ev := events.Event{
+func execEvent(at time.Duration, uid uint32, containerID string) events.AuditEvent {
+	ev := events.AuditEvent{
 		Kind:    events.KindProcessExec,
 		Time:    t0.Add(at),
 		Node:    "worker-1",
@@ -33,14 +33,14 @@ func execEvent(at time.Duration, uid uint32, containerID string) events.Event {
 	return ev
 }
 
-func escalationEvent(at time.Duration, containerID string) events.Event {
+func escalationEvent(at time.Duration, containerID string) events.AuditEvent {
 	ev := execEvent(at, 0, containerID)
 	ev.Kind = events.KindPrivilegeEscalation
 	ev.Data = &events.PrivilegeEscalation{Syscall: "setuid", OldUID: 1000, NewUID: 0}
 	return ev
 }
 
-func mustIngest(t *testing.T, a *Agent, evs ...events.Event) []string {
+func mustIngest(t *testing.T, a *Agent, evs ...events.AuditEvent) []string {
 	t.Helper()
 	ids, err := a.Ingest(evs)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestIngestIsAtomic(t *testing.T) {
 	bad := execEvent(0, 0, webID)
 	bad.Node = ""
 	bad.Process.PID = 0
-	_, err := a.Ingest([]events.Event{execEvent(0, 0, webID), bad})
+	_, err := a.Ingest([]events.AuditEvent{execEvent(0, 0, webID), bad})
 
 	var inv *InvalidEventError
 	if !errors.As(err, &inv) || inv.Index != 1 {

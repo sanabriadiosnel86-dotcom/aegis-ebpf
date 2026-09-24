@@ -1,5 +1,9 @@
 //! aegis-probe loads the eBPF programs of Aegis-eBPF, attaches them to their
-//! tracepoints and forwards their events to aegis-agent.
+//! tracepoints and forwards their audit events to aegis-agent.
+//!
+//! The probe is read-only: it observes syscalls and never alters the audited
+//! system. The one exception, mounting tracefs when the host has not, only
+//! happens with `--mount-tracefs`.
 
 use std::{
     ffi::CString,
@@ -8,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use aegis_probe::event::{self, Converter, Event, Record};
+use aegis_probe::event::{self, AuditEvent, Converter, Record};
 use anyhow::{Context as _, anyhow};
 use aya::{
     Ebpf,
@@ -51,11 +55,17 @@ struct Opt {
     /// Where the procfs of the host is mounted.
     #[arg(long, default_value = "/proc")]
     proc_root: PathBuf,
+    /// Mount tracefs on /sys/kernel/tracing when it is missing. Off by
+    /// default, so that the probe changes nothing on the host.
+    #[arg(long)]
+    mount_tracefs: bool,
 }
 
 /// Tracepoints of each eBPF program.
-const PROGRAMS: [(&str, &[(&str, &str)]); 7] = [
-    ("aegis_process_exec", &[("sched", "sched_process_exec")]),
+const PROGRAMS: [(&str, &[(&str, &str)]); 9] = [
+    ("aegis_execve", &[("syscalls", "sys_enter_execve")]),
+    ("aegis_connect", &[("syscalls", "sys_enter_connect")]),
+    ("aegis_ptrace", &[("syscalls", "sys_enter_ptrace")]),
     ("aegis_openat", &[("syscalls", "sys_enter_openat")]),
     ("aegis_openat2", &[("syscalls", "sys_enter_openat2")]),
     ("aegis_open", &[("syscalls", "sys_enter_open")]),
@@ -103,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let sink = Sink::new(&opt.agent_url)?;
 
     bump_memlock_rlimit();
-    mount_tracefs();
+    ensure_tracefs(opt.mount_tracefs)?;
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/aegis-probe"
@@ -176,7 +186,7 @@ fn attach(ebpf: &mut Ebpf, name: &str, tracepoints: &[(&str, &str)]) -> anyhow::
 async fn read_events(
     ring: RingBuf<MapData>,
     converter: Converter,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<AuditEvent>,
 ) -> anyhow::Result<()> {
     let mut ring = AsyncFd::new(ring)?;
     let mut dropped = 0u64;
@@ -201,7 +211,7 @@ async fn read_events(
 /// Sends the queued events in batches of at most `batch_size`, waiting at
 /// most `flush_interval` for a batch to fill up.
 async fn forward(
-    mut rx: mpsc::Receiver<Event>,
+    mut rx: mpsc::Receiver<AuditEvent>,
     sink: Sink,
     batch_size: usize,
     flush_interval: Duration,
@@ -232,7 +242,7 @@ enum Sink {
 
 #[derive(Serialize)]
 struct Batch<'a> {
-    events: &'a [Event],
+    events: &'a [AuditEvent],
 }
 
 impl Sink {
@@ -249,7 +259,7 @@ impl Sink {
 
     /// Sends a batch. The agent rejects invalid batches as a whole; failed
     /// batches are logged and dropped.
-    async fn send(&self, events: &[Event]) {
+    async fn send(&self, events: &[AuditEvent]) {
         match self {
             Self::Stdout => {
                 let mut out = std::io::stdout().lock();
@@ -298,14 +308,21 @@ fn bump_memlock_rlimit() {
     }
 }
 
-/// Mounts tracefs, needed to attach tracepoints, when no one did: containers
-/// get a fresh /sys without it.
-fn mount_tracefs() {
+/// Makes sure tracefs, which attaching tracepoints needs, is available.
+/// Containers get a fresh /sys without it. Only with `mount` does the probe
+/// mount it; otherwise it just checks, and changes nothing on the host.
+fn ensure_tracefs(mount: bool) -> anyhow::Result<()> {
     const TRACEFS: &str = "/sys/kernel/tracing";
     if Path::new(TRACEFS).join("events").exists()
         || Path::new("/sys/kernel/debug/tracing/events").exists()
     {
-        return;
+        return Ok(());
+    }
+    if !mount {
+        return Err(anyhow!(
+            "tracefs is not mounted on {TRACEFS}: mount it \
+             (mount -t tracefs nodev {TRACEFS}) or pass --mount-tracefs"
+        ));
     }
     let (source, target) = (
         CString::new("tracefs").unwrap(),
@@ -321,12 +338,10 @@ fn mount_tracefs() {
             std::ptr::null(),
         )
     };
-    if ret == 0 {
-        info!("mounted tracefs on {TRACEFS}");
-    } else {
-        warn!(
-            "mounting tracefs on {TRACEFS}: {}",
-            std::io::Error::last_os_error()
-        );
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("mounting tracefs on {TRACEFS}"));
     }
+    info!("mounted tracefs on {TRACEFS}");
+    Ok(())
 }

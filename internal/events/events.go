@@ -1,29 +1,32 @@
-// Package events defines the security events that the eBPF probe reports to
-// the control plane. The wire format is specified in api/openapi.yaml.
+// Package events defines the audit events that the eBPF probe reports to the
+// control plane. The wire format is specified in api/openapi.yaml.
 package events
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"slices"
 	"time"
 	"unicode/utf8"
 )
 
-// Kind identifies the kernel activity that an Event describes.
+// Kind identifies the kernel activity that an AuditEvent describes.
 type Kind string
 
 const (
 	KindProcessExec         Kind = "process_exec"
 	KindFileOpen            Kind = "file_open"
 	KindPrivilegeEscalation Kind = "privilege_escalation"
+	KindNetworkConnect      Kind = "network_connect"
+	KindPtrace              Kind = "ptrace"
 )
 
 // Kinds returns every known Kind.
 func Kinds() []Kind {
-	return []Kind{KindProcessExec, KindFileOpen, KindPrivilegeEscalation}
+	return []Kind{KindProcessExec, KindFileOpen, KindPrivilegeEscalation, KindNetworkConnect, KindPtrace}
 }
 
 // Valid reports whether k is a known Kind.
@@ -51,8 +54,8 @@ func (s Severity) Rank() int { return slices.Index(Severities(), s) }
 // Valid reports whether s is a known Severity.
 func (s Severity) Valid() bool { return s.Rank() >= 0 }
 
-// Event is a security-relevant kernel event.
-type Event struct {
+// AuditEvent is a security-relevant kernel event, recorded for audit.
+type AuditEvent struct {
 	// ID and Severity are assigned by the agent on ingestion.
 	ID        string     `json:"id"`
 	Kind      Kind       `json:"kind"`
@@ -65,8 +68,8 @@ type Event struct {
 	Data Data `json:"data"`
 }
 
-// Data is the kind-specific payload of an Event: *ProcessExec, *FileOpen or
-// *PrivilegeEscalation.
+// Data is the kind-specific payload of an AuditEvent: *ProcessExec,
+// *FileOpen, *PrivilegeEscalation, *NetworkConnect or *Ptrace.
 type Data interface {
 	Kind() Kind
 	validate() []error
@@ -76,6 +79,9 @@ type Data interface {
 type ProcessExec struct {
 	Filename string   `json:"filename"`
 	Argv     []string `json:"argv,omitempty"`
+	// ArgvTruncated is set when the command line had more arguments than
+	// the probe captures.
+	ArgvTruncated bool `json:"argv_truncated,omitempty"`
 }
 
 // FileOpen is the payload of KindFileOpen events.
@@ -89,6 +95,32 @@ type PrivilegeEscalation struct {
 	Syscall string `json:"syscall"`
 	OldUID  uint32 `json:"old_uid"`
 	NewUID  uint32 `json:"new_uid"`
+}
+
+// NetworkConnect is the payload of KindNetworkConnect events: an outbound
+// connect(2) to an IP address.
+type NetworkConnect struct {
+	// Family is "ipv4" or "ipv6".
+	Family  string `json:"family"`
+	Address string `json:"address"`
+	Port    uint16 `json:"port"`
+	FD      int32  `json:"fd"`
+}
+
+// Ptrace is the payload of KindPtrace events: a ptrace(2) call against
+// another process.
+type Ptrace struct {
+	// Request names the operation, such as "PTRACE_ATTACH";
+	// "PTRACE_UNKNOWN" when the probe does not know it.
+	Request string `json:"request"`
+	// RequestCode is the request as the kernel received it.
+	RequestCode int64 `json:"request_code"`
+	// TargetPID is the pid argument as the caller passed it, in the caller's
+	// PID namespace: inside a container it differs from Process.PID, which
+	// is in the node's namespace.
+	TargetPID int32 `json:"target_pid"`
+	// Addr is the address argument, in hexadecimal.
+	Addr string `json:"addr"`
 }
 
 // Process describes the task that caused an event.
@@ -119,6 +151,8 @@ type Pod struct {
 func (*ProcessExec) Kind() Kind         { return KindProcessExec }
 func (*FileOpen) Kind() Kind            { return KindFileOpen }
 func (*PrivilegeEscalation) Kind() Kind { return KindPrivilegeEscalation }
+func (*NetworkConnect) Kind() Kind      { return KindNetworkConnect }
+func (*Ptrace) Kind() Kind              { return KindPtrace }
 
 func newData(k Kind) Data {
 	switch k {
@@ -128,14 +162,18 @@ func newData(k Kind) Data {
 		return new(FileOpen)
 	case KindPrivilegeEscalation:
 		return new(PrivilegeEscalation)
+	case KindNetworkConnect:
+		return new(NetworkConnect)
+	case KindPtrace:
+		return new(Ptrace)
 	}
 	return nil
 }
 
 // UnmarshalJSON decodes the "data" member according to "kind". An unknown
 // kind leaves Data nil; Validate reports it.
-func (e *Event) UnmarshalJSON(b []byte) error {
-	type plain Event // drops the methods, avoiding recursion
+func (e *AuditEvent) UnmarshalJSON(b []byte) error {
+	type plain AuditEvent // drops the methods, avoiding recursion
 	var aux struct {
 		plain
 		Data json.RawMessage `json:"data"` // shadows plain.Data
@@ -143,7 +181,7 @@ func (e *Event) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &aux); err != nil {
 		return err
 	}
-	*e = Event(aux.plain)
+	*e = AuditEvent(aux.plain)
 	d := newData(e.Kind)
 	if d == nil || len(aux.Data) == 0 || string(aux.Data) == "null" {
 		return nil
@@ -167,7 +205,7 @@ func ValidContainerID(id string) bool { return containerIDRe.MatchString(id) }
 // Validate checks e against the constraints of api/openapi.yaml, as for an
 // event received from a probe: it ignores ID and Severity. The returned error
 // joins one error per violation.
-func (e *Event) Validate() error {
+func (e *AuditEvent) Validate() error {
 	var errs []error
 	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
@@ -274,6 +312,35 @@ func (d *PrivilegeEscalation) validate() []error {
 		return nil
 	}
 	return []error{fmt.Errorf("data.syscall %q is not one of setuid, setreuid, setresuid", d.Syscall)}
+}
+
+func (d *NetworkConnect) validate() []error {
+	addr, err := netip.ParseAddr(d.Address)
+	switch {
+	case d.Family != "ipv4" && d.Family != "ipv6":
+		return []error{fmt.Errorf("data.family %q is not one of ipv4, ipv6", d.Family)}
+	case err != nil || addr.Zone() != "":
+		return []error{fmt.Errorf("data.address %q is not an IP address", d.Address)}
+	case d.Family == "ipv4" && !addr.Is4(), d.Family == "ipv6" && !addr.Is6():
+		return []error{fmt.Errorf("data.address %q is not an %s address", d.Address, d.Family)}
+	}
+	return nil
+}
+
+var (
+	ptraceRequestRe = regexp.MustCompile(`^PTRACE_[A-Z]+$`)
+	hexRe           = regexp.MustCompile(`^0x[0-9a-f]+$`)
+)
+
+func (d *Ptrace) validate() []error {
+	var errs []error
+	if !ptraceRequestRe.MatchString(d.Request) {
+		errs = append(errs, fmt.Errorf("data.request %q is not a PTRACE_ request name", d.Request))
+	}
+	if !hexRe.MatchString(d.Addr) {
+		errs = append(errs, fmt.Errorf("data.addr %q is not a hexadecimal address", d.Addr))
+	}
+	return errs
 }
 
 // lengthIn reports whether s has between lo and hi characters, counted as

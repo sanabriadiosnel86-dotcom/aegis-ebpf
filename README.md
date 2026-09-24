@@ -28,26 +28,33 @@ flowchart LR
 
 | Path | Language | Role |
 | --- | --- | --- |
-| [`crates/aegis-probe-ebpf`](crates/aegis-probe-ebpf) | Rust (`no_std`, [Aya](https://aya-rs.dev)) | eBPF programs attached to kernel tracepoints. They write events in place into a ring buffer. |
+| [`crates/aegis-probe-ebpf`](crates/aegis-probe-ebpf) | Rust (`no_std`, [Aya](https://aya-rs.dev)) | Passive eBPF programs attached to kernel tracepoints. They write audit records in place into a `BPF_MAP_TYPE_RINGBUF`. |
 | [`crates/aegis-probe-common`](crates/aegis-probe-common) | Rust (`no_std`) | `#[repr(C)]` records shared by the kernel and user-space sides. |
-| [`crates/aegis-probe`](crates/aegis-probe) | Rust (Aya, Tokio) | Loads and attaches the programs, resolves the container of each process from `/proc`, and sends events to the agent in batches. |
+| [`crates/aegis-probe`](crates/aegis-probe) | Rust (Aya, Tokio) | Loads and attaches the programs, decodes the records into `AuditEvent`s, resolves the container of each process from `/proc`, and sends them to the agent in batches. |
 | [`cmd/aegis-agent`](cmd/aegis-agent) | Go | The control plane: ingests events, classifies them and keeps remediations ([`internal/agent`](internal/agent)). |
 | [`internal/fixer`](internal/fixer) | Go | The syntactic engine: rules that map events to hardening plans, and the engine that applies those plans to manifests. |
-| [`internal/events`](internal/events) | Go | Event types and their validation. |
+| [`internal/events`](internal/events) | Go | The `AuditEvent` type, its payloads and their validation. |
 | [`api/openapi.yaml`](api/openapi.yaml) | OpenAPI 3.0 | Contract of the events and of the agent API. |
 
-## Detections
+## Audit events and detections
 
-| Event (`kind`) | Kernel hook | Rule | Fix proposed for the container |
-| --- | --- | --- | --- |
-| `process_exec` | `sched:sched_process_exec` | AEG-001 · root process in a container (medium) | `securityContext.runAsNonRoot: true` |
-| `privilege_escalation` | `syscalls:sys_{enter,exit}_set{,re,res}uid` | AEG-002 · real UID changed to 0 (critical) | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
-| `file_open` | `syscalls:sys_enter_{openat,openat2,open,creat}` | AEG-003 · write under `/etc`, `/usr`, `/bin`… (high) | `readOnlyRootFilesystem: true` |
+The probe is strictly passive: its eBPF programs only read syscall
+arguments and write to the probe's own maps. They never write process
+memory, block or alter a syscall, or signal a process.
+
+| Event (`kind`) | Kernel hook | What it records | Rule | Fix proposed for the container |
+| --- | --- | --- | --- | --- |
+| `process_exec` | `syscalls:sys_enter_execve` | Program path and its first 16 arguments | AEG-001 · root process in a container (medium) | `securityContext.runAsNonRoot: true` |
+| `privilege_escalation` | `syscalls:sys_{enter,exit}_set{,re,res}uid` | Syscall and the UIDs before and after | AEG-002 · real UID changed to 0 (critical) | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| `file_open` | `syscalls:sys_enter_{openat,openat2,open,creat}` | Path and flags of opens with write intent | AEG-003 · write under `/etc`, `/usr`, `/bin`… (high) | `readOnlyRootFilesystem: true` |
+| `network_connect` | `syscalls:sys_enter_connect` | Destination IPv4 or IPv6 address and port | — (audit only) | — |
+| `ptrace` | `syscalls:sys_enter_ptrace` | Request, target PID and address | — (audit only) | — |
 
 Only processes that run in a container are reported by default: the probe
 recognizes the cgroups of Docker, containerd, CRI-O and Podman, and the pod
-UID under Kubernetes. Each rule opens one remediation per container; later
-matches increase its `occurrences`.
+UID under Kubernetes. The probe does not audit its own activity. Each rule
+opens one remediation per container; later matches increase its
+`occurrences`.
 
 ## The syntactic fixer
 
@@ -96,7 +103,10 @@ to override the defaults.
 
 `make up` starts the agent and the probe on the local Docker host with
 [`deploy/compose.yaml`](deploy/compose.yaml). The probe runs privileged in the
-PID namespace of the host; it needs Linux 5.8 or later. Then:
+PID namespace of the host; it needs Linux 5.8 or later and tracefs mounted on
+the host's `/sys/kernel/tracing`, which it reads through a read-only mount.
+Where tracefs is missing, `aegis-probe --mount-tracefs` mounts it; the probe
+never does so on its own. Then:
 
 ```sh
 docker run --rm alpine sh -c 'echo pwned > /etc/motd'
@@ -130,6 +140,12 @@ other options.
   events of very short-lived processes may lose it.
 - Pod names and container names are not resolved yet; without the container
   name, plans target every container of the pod.
+- `process_exec` is recorded when `execve(2)` enters the kernel: attempts that
+  fail, such as a program looked up along `PATH`, are recorded too, and
+  `process.comm` names the calling process. Arguments are captured up to 16,
+  of up to 127 bytes each; `argv_truncated` flags longer command lines.
+- The `target_pid` of a `ptrace` event is in the caller's PID namespace, so
+  inside a container it differs from the node-level `process.pid`.
 
 ## License
 

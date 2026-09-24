@@ -6,8 +6,9 @@ info:
     Event and remediation API served by `aegis-agent`, the control plane of
     Aegis-eBPF.
 
-    The eBPF probe (`aegis-probe`) observes security-relevant kernel activity
-    and reports it as **events** through `POST /v1/events`. The agent assigns
+    The eBPF probe (`aegis-probe`) passively observes security-relevant
+    kernel activity, without altering the audited system, and reports it as
+    **audit events** through `POST /v1/events`. The agent assigns
     every event an `id` and a `severity`, evaluates it against the rules of
     the syntactic fixer and aggregates matches into **remediations**:
     hardening plans for the Kubernetes workload that owns the offending
@@ -136,7 +137,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Event'
+                $ref: '#/components/schemas/AuditEvent'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -311,14 +312,21 @@ components:
       description: |
         Kind of kernel activity reported by the probe:
 
-        * `process_exec`: a process replaced its image with `execve(2)`
-          (tracepoint `sched:sched_process_exec`).
+        * `process_exec`: a process called `execve(2)` (tracepoint
+          `syscalls:sys_enter_execve`). It is reported on entry, so attempts
+          that fail, such as the lookups of a program along `PATH`, appear
+          too, and `process.comm` names the calling process.
         * `file_open`: a file was opened with write intent (`O_WRONLY`,
           `O_RDWR`, `O_CREAT` or `O_TRUNC`) through `openat(2)`.
         * `privilege_escalation`: a successful `setuid(2)`, `setreuid(2)` or
           `setresuid(2)` moved the real UID of a process from non-root to
           root.
-      enum: [process_exec, file_open, privilege_escalation]
+        * `network_connect`: a process started an outbound `connect(2)` to an
+          IPv4 or IPv6 address (tracepoint `syscalls:sys_enter_connect`).
+        * `ptrace`: a process called `ptrace(2)` to inspect or alter another
+          process (tracepoint `syscalls:sys_enter_ptrace`);
+          `PTRACE_TRACEME` is not reported.
+      enum: [process_exec, file_open, privilege_escalation, network_connect, ptrace]
 
     Severity:
       type: string
@@ -327,21 +335,26 @@ components:
         matched.
       enum: [info, low, medium, high, critical]
 
-    Event:
+    AuditEvent:
       description: |
-        A security-relevant kernel event. `kind` selects the shape of `data`.
+        A security-relevant kernel event, recorded for audit. `kind` selects
+        the shape of `data`.
       oneOf:
         - $ref: '#/components/schemas/ProcessExecEvent'
         - $ref: '#/components/schemas/FileOpenEvent'
         - $ref: '#/components/schemas/PrivilegeEscalationEvent'
+        - $ref: '#/components/schemas/NetworkConnectEvent'
+        - $ref: '#/components/schemas/PtraceEvent'
       discriminator:
         propertyName: kind
         mapping:
           process_exec: '#/components/schemas/ProcessExecEvent'
           file_open: '#/components/schemas/FileOpenEvent'
           privilege_escalation: '#/components/schemas/PrivilegeEscalationEvent'
+          network_connect: '#/components/schemas/NetworkConnectEvent'
+          ptrace: '#/components/schemas/PtraceEvent'
 
-    EventBase:
+    AuditEventBase:
       type: object
       description: Properties shared by every kind of event.
       required: [id, kind, time, node, severity, process]
@@ -374,7 +387,7 @@ components:
     ProcessExecEvent:
       description: Event of kind `process_exec`.
       allOf:
-        - $ref: '#/components/schemas/EventBase'
+        - $ref: '#/components/schemas/AuditEventBase'
         - type: object
           required: [data]
           properties:
@@ -387,7 +400,7 @@ components:
     FileOpenEvent:
       description: Event of kind `file_open`.
       allOf:
-        - $ref: '#/components/schemas/EventBase'
+        - $ref: '#/components/schemas/AuditEventBase'
         - type: object
           required: [data]
           properties:
@@ -400,7 +413,7 @@ components:
     PrivilegeEscalationEvent:
       description: Event of kind `privilege_escalation`.
       allOf:
-        - $ref: '#/components/schemas/EventBase'
+        - $ref: '#/components/schemas/AuditEventBase'
         - type: object
           required: [data]
           properties:
@@ -410,6 +423,32 @@ components:
             data:
               $ref: '#/components/schemas/PrivilegeEscalationData'
 
+    NetworkConnectEvent:
+      description: Event of kind `network_connect`.
+      allOf:
+        - $ref: '#/components/schemas/AuditEventBase'
+        - type: object
+          required: [data]
+          properties:
+            kind:
+              type: string
+              enum: [network_connect]
+            data:
+              $ref: '#/components/schemas/NetworkConnectData'
+
+    PtraceEvent:
+      description: Event of kind `ptrace`.
+      allOf:
+        - $ref: '#/components/schemas/AuditEventBase'
+        - type: object
+          required: [data]
+          properties:
+            kind:
+              type: string
+              enum: [ptrace]
+            data:
+              $ref: '#/components/schemas/PtraceData'
+
     ProcessExecData:
       type: object
       required: [filename]
@@ -418,16 +457,19 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
-          description: Path of the new program image, as passed to `execve(2)`.
+          description: Path of the program to run, as passed to `execve(2)`.
         argv:
           type: array
           maxItems: 256
           items:
             type: string
           description: |
-            Command line of the new image. Best effort: the probe reads it
-            from `/proc/<pid>/cmdline` and omits it when the process already
-            exited.
+            Arguments passed to `execve(2)`, read by the eBPF program when
+            the call enters the kernel. The probe captures the first 16, of
+            up to 127 bytes each.
+        argv_truncated:
+          type: boolean
+          description: Set when the command line had more arguments than `argv` holds.
 
     FileOpenData:
       type: object
@@ -463,6 +505,56 @@ components:
           $ref: '#/components/schemas/ID32'
         new_uid:
           $ref: '#/components/schemas/ID32'
+
+    NetworkConnectData:
+      type: object
+      required: [family, address, port, fd]
+      properties:
+        family:
+          type: string
+          enum: [ipv4, ipv6]
+        address:
+          type: string
+          description: Destination IP address, in the format of `family`.
+          example: 10.0.0.7
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: Destination port.
+        fd:
+          type: integer
+          format: int32
+          description: File descriptor of the socket.
+
+    PtraceData:
+      type: object
+      required: [request, request_code, target_pid, addr]
+      properties:
+        request:
+          type: string
+          pattern: '^PTRACE_[A-Z]+$'
+          description: |
+            Name of the operation, such as `PTRACE_ATTACH` or
+            `PTRACE_POKETEXT`; `PTRACE_UNKNOWN` when the probe does not know
+            it.
+          example: PTRACE_ATTACH
+        request_code:
+          type: integer
+          format: int64
+          description: The request as the kernel received it.
+        target_pid:
+          type: integer
+          format: int32
+          description: |
+            The `pid` argument as the caller passed it, in the caller's PID
+            namespace: inside a container it differs from `process.pid`,
+            which is in the namespace of the node.
+        addr:
+          type: string
+          pattern: '^0x[0-9a-f]+$'
+          description: Address argument, such as the target of a peek or a poke.
+          example: '0x7ffd1000'
 
     ID32:
       type: integer
@@ -550,7 +642,7 @@ components:
           minItems: 1
           maxItems: 1000
           items:
-            $ref: '#/components/schemas/Event'
+            $ref: '#/components/schemas/AuditEvent'
 
     IngestResult:
       type: object
@@ -573,7 +665,7 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/Event'
+            $ref: '#/components/schemas/AuditEvent'
 
     Rule:
       type: object

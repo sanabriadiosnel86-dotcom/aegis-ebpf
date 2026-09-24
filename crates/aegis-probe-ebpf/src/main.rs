@@ -1,9 +1,15 @@
-//! eBPF programs of the Aegis-eBPF probe.
+//! eBPF programs of the Aegis-eBPF probe: read-only audit telemetry.
 //!
-//! Each program reports its events to user space through the `EVENTS` ring
-//! buffer, as the structs of `aegis_probe_common`. Events are written in
-//! place, in memory reserved in the ring buffer: they never touch the
-//! 512-byte eBPF stack.
+//! Every program is strictly passive. It is attached to a tracepoint, reads
+//! the syscall arguments with `bpf_probe_read_*`, and writes only to this
+//! probe's own maps. None of them writes user memory, blocks or alters a
+//! syscall, or signals a process: the audited system behaves exactly as it
+//! would without the probe.
+//!
+//! Each program reports its records to user space through `EVENTS`, a
+//! `BPF_MAP_TYPE_RINGBUF`, as the structs of `aegis_probe_common`. Records are
+//! written in place, in memory reserved in the ring buffer: they never touch
+//! the 512-byte eBPF stack.
 //!
 //! The field offsets below come from
 //! `/sys/kernel/tracing/events/<category>/<name>/format`. Tracepoints are a
@@ -12,16 +18,18 @@
 #![no_main]
 
 use aegis_probe_common::{
-    EventHeader, FileOpen, MAX_PATH_LEN, PrivilegeEscalation, ProcessExec, TASK_COMM_LEN, kind,
+    ADDR_LEN, ARG_LEN, EventHeader, FileOpen, MAX_ARGV, MAX_PATH_LEN, NetworkConnect,
+    PrivilegeEscalation, ProcessExec, Ptrace, TASK_COMM_LEN,
+    address_family::{AF_INET, AF_INET6},
+    kind,
     open_flags::{O_CREAT, O_TRUNC, O_WRONLY, is_write_intent},
 };
 use aya_ebpf::{
-    EbpfContext,
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_probe_read_user,
         generated::{
             bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_ktime_get_boot_ns,
-            bpf_probe_read_kernel_str, bpf_probe_read_user_str,
+            bpf_probe_read_user_str,
         },
     },
     macros::{map, tracepoint},
@@ -29,7 +37,8 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 
-/// Events for user space: 1 MiB holds about 1,800 of the largest ones.
+/// Audit records for user space: a 1 MiB `BPF_MAP_TYPE_RINGBUF`, shared by
+/// every CPU so that records keep their order.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 
@@ -39,8 +48,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 #[map]
 static SETUID_CALLS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(16384, 0);
 
-/// sched/sched_process_exec: `__data_loc char[] filename`.
-const EXEC_FILENAME: usize = 8;
+/// syscalls/sys_enter_execve: `const char *filename`.
+const EXECVE_FILENAME: usize = 16;
+/// syscalls/sys_enter_execve: `const char *const *argv`.
+const EXECVE_ARGV: usize = 24;
 /// syscalls/sys_enter_openat and sys_enter_openat2: `const char *filename`.
 const OPENAT_FILENAME: usize = 24;
 /// syscalls/sys_enter_openat: `int flags`, in an 8-byte slot.
@@ -52,17 +63,38 @@ const OPENAT2_HOW: usize = 32;
 const OPEN_FILENAME: usize = 16;
 /// syscalls/sys_enter_open: `int flags`, in an 8-byte slot.
 const OPEN_FLAGS: usize = 24;
+/// syscalls/sys_enter_connect: `int fd`, in an 8-byte slot.
+const CONNECT_FD: usize = 16;
+/// syscalls/sys_enter_connect: `struct sockaddr *uservaddr`.
+const CONNECT_ADDR: usize = 24;
+/// syscalls/sys_enter_ptrace: `long request`.
+const PTRACE_REQUEST: usize = 16;
+/// syscalls/sys_enter_ptrace: `long pid`, the target process.
+const PTRACE_PID: usize = 24;
+/// syscalls/sys_enter_ptrace: `unsigned long addr`.
+const PTRACE_ADDR: usize = 32;
 /// syscalls/sys_exit_*: `int __syscall_nr`.
 const EXIT_SYSCALL_NR: usize = 8;
 /// syscalls/sys_exit_*: `long ret`.
 const EXIT_RET: usize = 16;
 
-/// Attached to sched/sched_process_exec: every successful `execve(2)`.
+/// `ptrace(2)` request that makes the caller a tracee; it never touches
+/// another process, so it is not reported.
+const PTRACE_TRACEME: i64 = 0;
+/// Offset of `sin_port`/`sin6_port` in `sockaddr_in`/`sockaddr_in6`.
+const SOCKADDR_PORT: usize = 2;
+/// Offset of `sin_addr` in `sockaddr_in`.
+const SOCKADDR_IN_ADDR: usize = 4;
+/// Offset of `sin6_addr` in `sockaddr_in6`.
+const SOCKADDR_IN6_ADDR: usize = 8;
+
+/// Attached to syscalls/sys_enter_execve: a process is about to run a new
+/// program. Captures the program path and its arguments.
 #[tracepoint]
-pub fn aegis_process_exec(ctx: TracePointContext) -> u32 {
-    // The filename is stored in the tracepoint record itself; the low 16
-    // bits of its __data_loc descriptor hold its offset.
-    let Ok(data_loc) = (unsafe { ctx.read_at::<u32>(EXEC_FILENAME) }) else {
+pub fn aegis_execve(ctx: TracePointContext) -> u32 {
+    let filename = unsafe { ctx.read_at::<*const u8>(EXECVE_FILENAME) };
+    let argv = unsafe { ctx.read_at::<*const *const u8>(EXECVE_ARGV) };
+    let (Ok(filename), Ok(argv)) = (filename, argv) else {
         return 0;
     };
     let Some(mut entry) = EVENTS.reserve::<ProcessExec>(0) else {
@@ -71,13 +103,122 @@ pub fn aegis_process_exec(ctx: TracePointContext) -> u32 {
     let ev = entry.as_mut_ptr();
     unsafe {
         fill_header(&raw mut (*ev).header, kind::PROCESS_EXEC);
-        let filename = ctx.as_ptr().cast::<u8>().add((data_loc & 0xffff) as usize);
-        // On failure the helper zeroes the buffer: user space sees "".
-        bpf_probe_read_kernel_str(
+        bpf_probe_read_user_str(
             (&raw mut (*ev).filename).cast(),
             MAX_PATH_LEN as u32,
             filename.cast(),
         );
+        let (argc, truncated) = read_argv(argv, (&raw mut (*ev).args).cast());
+        (*ev).argc = argc;
+        (*ev).argv_truncated = truncated;
+    }
+    entry.submit(0);
+    0
+}
+
+/// Reads up to [`MAX_ARGV`] arguments from the user-space `argv` array into
+/// `slots` (the first element of `ProcessExec::args`), NUL-terminating each.
+/// Returns the number of arguments stored and whether the command line held
+/// more.
+#[inline(always)]
+unsafe fn read_argv(argv: *const *const u8, slots: *mut [u8; ARG_LEN]) -> (u32, u32) {
+    let mut argc: u32 = 0;
+    for i in 0..MAX_ARGV {
+        // Mask the index so the verifier can prove the store is in bounds.
+        let slot = unsafe { slots.add(i & (MAX_ARGV - 1)) };
+        let Ok(argp) = (unsafe { bpf_probe_read_user::<*const u8>(argv.add(i)) }) else {
+            break;
+        };
+        if argp.is_null() {
+            break;
+        }
+        unsafe {
+            (*slot)[0] = 0; // empty string if the read below fails
+            bpf_probe_read_user_str(slot.cast(), ARG_LEN as u32, argp.cast());
+        }
+        argc += 1;
+    }
+    let mut truncated = 0;
+    if argc == MAX_ARGV as u32
+        && let Ok(argp) = (unsafe { bpf_probe_read_user::<*const u8>(argv.add(MAX_ARGV)) })
+        && !argp.is_null()
+    {
+        truncated = 1;
+    }
+    (argc, truncated)
+}
+
+/// Attached to syscalls/sys_enter_connect: an outbound connection to an IPv4
+/// or IPv6 address.
+#[tracepoint]
+pub fn aegis_connect(ctx: TracePointContext) -> u32 {
+    let fd = unsafe { ctx.read_at::<u64>(CONNECT_FD) };
+    let uservaddr = unsafe { ctx.read_at::<*const u8>(CONNECT_ADDR) };
+    let (Ok(fd), Ok(uservaddr)) = (fd, uservaddr) else {
+        return 0;
+    };
+    if uservaddr.is_null() {
+        return 0;
+    }
+    let Ok(family) = (unsafe { bpf_probe_read_user::<u16>(uservaddr.cast()) }) else {
+        return 0;
+    };
+    if family != AF_INET && family != AF_INET6 {
+        return 0;
+    }
+    let Ok(be_port) = (unsafe { bpf_probe_read_user::<u16>(uservaddr.add(SOCKADDR_PORT).cast()) })
+    else {
+        return 0;
+    };
+    let Some(mut entry) = EVENTS.reserve::<NetworkConnect>(0) else {
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        fill_header(&raw mut (*ev).header, kind::NETWORK_CONNECT);
+        (*ev).fd = fd as i32;
+        (*ev).family = family;
+        (*ev).port = u16::from_be(be_port);
+        (*ev).addr = [0u8; ADDR_LEN];
+        if family == AF_INET {
+            if let Ok(v4) = bpf_probe_read_user::<[u8; 4]>(uservaddr.add(SOCKADDR_IN_ADDR).cast()) {
+                (*ev).addr[0] = v4[0];
+                (*ev).addr[1] = v4[1];
+                (*ev).addr[2] = v4[2];
+                (*ev).addr[3] = v4[3];
+            }
+        } else if let Ok(v6) =
+            bpf_probe_read_user::<[u8; ADDR_LEN]>(uservaddr.add(SOCKADDR_IN6_ADDR).cast())
+        {
+            (*ev).addr = v6;
+        }
+    }
+    entry.submit(0);
+    0
+}
+
+/// Attached to syscalls/sys_enter_ptrace: a process is inspecting or altering
+/// another process, a common step of code injection.
+#[tracepoint]
+pub fn aegis_ptrace(ctx: TracePointContext) -> u32 {
+    let Ok(request) = (unsafe { ctx.read_at::<i64>(PTRACE_REQUEST) }) else {
+        return 0;
+    };
+    if request == PTRACE_TRACEME {
+        return 0;
+    }
+    let target = unsafe { ctx.read_at::<i64>(PTRACE_PID) }.unwrap_or(0);
+    let addr = unsafe { ctx.read_at::<u64>(PTRACE_ADDR) }.unwrap_or(0);
+    let Some(mut entry) = EVENTS.reserve::<Ptrace>(0) else {
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        fill_header(&raw mut (*ev).header, kind::PTRACE);
+        (*ev).request = request;
+        (*ev).target_pid = target as i32;
+        (*ev)._pad = 0;
+        (*ev).addr = addr;
     }
     entry.submit(0);
     0

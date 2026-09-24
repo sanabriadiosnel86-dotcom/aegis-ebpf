@@ -124,6 +124,22 @@ const probeBatch = `{"events": [
     "node": "worker-1",
     "process": {"pid": 1, "uid": 0, "gid": 0, "comm": "systemd"},
     "data": {"path": "/etc/machine-id", "flags": ["O_WRONLY", "O_CREAT", "O_TRUNC"]}
+  },
+  {
+    "kind": "network_connect",
+    "time": "2026-09-23T23:01:05Z",
+    "node": "worker-1",
+    "process": {"pid": 4250, "uid": 1000, "gid": 1000, "comm": "curl"},
+    "container": {"id": "` + webID + `"},
+    "data": {"family": "ipv6", "address": "2001:db8::1", "port": 443, "fd": 5}
+  },
+  {
+    "kind": "ptrace",
+    "time": "2026-09-23T23:01:06Z",
+    "node": "worker-1",
+    "process": {"pid": 4251, "uid": 0, "gid": 0, "comm": "gdb"},
+    "container": {"id": "` + webID + `"},
+    "data": {"request": "PTRACE_ATTACH", "request_code": 16, "target_pid": 4242, "addr": "0x0"}
   }
 ]}`
 
@@ -148,21 +164,30 @@ func TestHTTPEventsAndRemediations(t *testing.T) {
 	rec = c.do("POST", "/v1/events", "application/json", probeBatch, true)
 	expectStatus(t, rec, http.StatusAccepted)
 	ingested := decodeBody[ingestResult](t, rec)
-	if ingested.Accepted != 3 || len(ingested.IDs) != 3 {
-		t.Fatalf("ingestion result = %+v, want 3 accepted events", ingested)
+	if ingested.Accepted != 5 || len(ingested.IDs) != 5 {
+		t.Fatalf("ingestion result = %+v, want 5 accepted events", ingested)
 	}
 
 	rec = c.do("GET", "/v1/events", "", "", true)
 	expectStatus(t, rec, http.StatusOK)
 	all := decodeBody[list[json.RawMessage]](t, rec).Items
-	if len(all) != 3 {
-		t.Errorf("listed %d events, want 3", len(all))
+	if len(all) != 5 {
+		t.Errorf("listed %d events, want 5", len(all))
 	}
 
 	rec = c.do("GET", "/v1/events?kind=privilege_escalation&min_severity=critical&container_id="+webID+"&limit=10", "", "", true)
 	expectStatus(t, rec, http.StatusOK)
 	if items := decodeBody[list[json.RawMessage]](t, rec).Items; len(items) != 1 {
 		t.Errorf("filtered listing returned %d events, want 1", len(items))
+	}
+
+	for _, kind := range []string{"network_connect", "ptrace"} {
+		rec = c.do("GET", "/v1/events?kind="+kind, "", "", true)
+		expectStatus(t, rec, http.StatusOK)
+		items := decodeBody[list[map[string]any]](t, rec).Items
+		if len(items) != 1 || items[0]["severity"] != "info" {
+			t.Errorf("events of kind %s = %v, want one with severity info", kind, items)
+		}
 	}
 
 	rec = c.do("GET", "/v1/events/"+ingested.IDs[1], "", "", true)
